@@ -1,916 +1,1358 @@
 /*
- * This file is part of Baritone.
+ * Copyright 2012 Netflix, Inc.
  *
- * Baritone is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
  *
- * Baritone is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Lesser General Public License for more details.
+ *        http://www.apache.org/licenses/LICENSE-2.0
  *
- * You should have received a copy of the GNU Lesser General Public License
- * along with Baritone.  If not, see <https://www.gnu.org/licenses/>.
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
  */
 
-package baritone.process;
+package com.netflix.eureka.registry;
 
-import baritone.Baritone;
-import baritone.api.pathing.goals.Goal;
-import baritone.api.pathing.goals.GoalBlock;
-import baritone.api.pathing.goals.GoalComposite;
-import baritone.api.pathing.goals.GoalGetToBlock;
-import baritone.api.process.IBuilderProcess;
-import baritone.api.process.PathingCommand;
-import baritone.api.process.PathingCommandType;
-import baritone.api.schematic.FillSchematic;
-import baritone.api.schematic.ISchematic;
-import baritone.api.schematic.IStaticSchematic;
-import baritone.api.schematic.format.ISchematicFormat;
-import baritone.api.utils.BetterBlockPos;
-import baritone.api.utils.RayTraceUtils;
-import baritone.api.utils.Rotation;
-import baritone.api.utils.RotationUtils;
-import baritone.api.utils.input.Input;
-import baritone.pathing.movement.CalculationContext;
-import baritone.pathing.movement.Movement;
-import baritone.pathing.movement.MovementHelper;
-import baritone.utils.BaritoneProcessHelper;
-import baritone.utils.BlockStateInterface;
-import baritone.utils.NotificationHelper;
-import baritone.utils.PathingCommandContext;
-import baritone.utils.schematic.MapArtSchematic;
-import baritone.utils.schematic.SchematicSystem;
-import baritone.utils.schematic.schematica.SchematicaHelper;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
-import net.minecraft.block.BlockAir;
-import net.minecraft.block.BlockLiquid;
-import net.minecraft.block.state.IBlockState;
-import net.minecraft.init.Blocks;
-import net.minecraft.item.ItemBlock;
-import net.minecraft.item.ItemStack;
-import net.minecraft.util.EnumFacing;
-import net.minecraft.util.Tuple;
-import net.minecraft.util.math.*;
+import javax.annotation.Nullable;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.util.AbstractQueue;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Random;
+import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.util.*;
-import java.util.stream.Collectors;
+import com.google.common.cache.CacheBuilder;
+import com.netflix.appinfo.InstanceInfo;
+import com.netflix.appinfo.InstanceInfo.ActionType;
+import com.netflix.appinfo.InstanceInfo.InstanceStatus;
+import com.netflix.appinfo.LeaseInfo;
+import com.netflix.discovery.EurekaClientConfig;
+import com.netflix.discovery.shared.Application;
+import com.netflix.discovery.shared.Applications;
+import com.netflix.discovery.shared.Pair;
+import com.netflix.eureka.EurekaServerConfig;
+import com.netflix.eureka.lease.Lease;
+import com.netflix.eureka.registry.rule.InstanceStatusOverrideRule;
+import com.netflix.eureka.resources.ServerCodecs;
+import com.netflix.eureka.util.MeasuredRate;
+import com.netflix.servo.annotations.DataSourceType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import static baritone.api.pathing.movement.ActionCosts.COST_INF;
+import static com.netflix.eureka.util.EurekaMonitors.*;
 
-public final class BuilderProcess extends BaritoneProcessHelper implements IBuilderProcess {
+/**
+ * Handles all registry requests from eureka clients.
+ *
+ * <p>
+ * Primary operations that are performed are the
+ * <em>Registers</em>, <em>Renewals</em>, <em>Cancels</em>, <em>Expirations</em>, and <em>Status Changes</em>. The
+ * registry also stores only the delta operations
+ * </p>
+ *
+ * @author Karthik Ranganathan
+ *
+ */
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    private static final Logger logger = LoggerFactory.getLogger(AbstractInstanceRegistry.class);
 
-    private HashSet<BetterBlockPos> incorrectPositions;
-    private LongOpenHashSet observedCompleted; // positions that are completed even if they're out of render distance and we can't make sure right now
-    private String name;
-    private ISchematic realSchematic;
-    private ISchematic schematic;
-    private Vec3i origin;
-    private int ticks;
-    private boolean paused;
-    private int layer;
-    private int numRepeats;
-    private List<IBlockState> approxPlaceable;
+    private static final String[] EMPTY_STR_ARRAY = new String[0];
+    private final ConcurrentHashMap<String, Map<String, Lease<InstanceInfo>>> registry
+            = new ConcurrentHashMap<String, Map<String, Lease<InstanceInfo>>>();
+    protected Map<String, RemoteRegionRegistry> regionNameVSRemoteRegistry = new HashMap<String, RemoteRegionRegistry>();
+    protected final ConcurrentMap<String, InstanceStatus> overriddenInstanceStatusMap = CacheBuilder
+            .newBuilder().initialCapacity(500)
+            .expireAfterAccess(1, TimeUnit.HOURS)
+            .<String, InstanceStatus>build().asMap();
 
-    public BuilderProcess(Baritone baritone) {
-        super(baritone);
+    // CircularQueues here for debugging/statistics purposes only
+    private final CircularQueue<Pair<Long, String>> recentRegisteredQueue;
+    private final CircularQueue<Pair<Long, String>> recentCanceledQueue;
+    private ConcurrentLinkedQueue<RecentlyChangedItem> recentlyChangedQueue = new ConcurrentLinkedQueue<RecentlyChangedItem>();
+
+    private final ReentrantReadWriteLock readWriteLock = new ReentrantReadWriteLock();
+    private final Lock read = readWriteLock.readLock();
+    private final Lock write = readWriteLock.writeLock();
+    protected final Object lock = new Object();
+
+    private Timer deltaRetentionTimer = new Timer("Eureka-DeltaRetentionTimer", true);
+    private Timer evictionTimer = new Timer("Eureka-EvictionTimer", true);
+    private final MeasuredRate renewsLastMin;
+
+    private final AtomicReference<EvictionTask> evictionTaskRef = new AtomicReference<EvictionTask>();
+
+    protected String[] allKnownRemoteRegions = EMPTY_STR_ARRAY;
+    protected volatile int numberOfRenewsPerMinThreshold;
+    protected volatile int expectedNumberOfClientsSendingRenews;
+
+    protected final EurekaServerConfig serverConfig;
+    protected final EurekaClientConfig clientConfig;
+    protected final ServerCodecs serverCodecs;
+    protected volatile ResponseCache responseCache;
+
+    /**
+     * Create a new, empty instance registry.
+     */
+    protected AbstractInstanceRegistry(EurekaServerConfig serverConfig, EurekaClientConfig clientConfig, ServerCodecs serverCodecs) {
+        this.serverConfig = serverConfig;
+        this.clientConfig = clientConfig;
+        this.serverCodecs = serverCodecs;
+        this.recentCanceledQueue = new CircularQueue<Pair<Long, String>>(1000);
+        this.recentRegisteredQueue = new CircularQueue<Pair<Long, String>>(1000);
+
+        this.renewsLastMin = new MeasuredRate(1000 * 60 * 1);
+
+        this.deltaRetentionTimer.schedule(getDeltaRetentionTask(),
+                serverConfig.getDeltaRetentionTimerIntervalInMs(),
+                serverConfig.getDeltaRetentionTimerIntervalInMs());
     }
 
     @Override
-    public void build(String name, ISchematic schematic, Vec3i origin) {
-        this.name = name;
-        this.schematic = schematic;
-        this.realSchematic = null;
-        int x = origin.getX();
-        int y = origin.getY();
-        int z = origin.getZ();
-        if (Baritone.settings().schematicOrientationX.value) {
-            x += schematic.widthX();
+    public synchronized void initializedResponseCache() {
+        if (responseCache == null) {
+            responseCache = new ResponseCacheImpl(serverConfig, serverCodecs, this);
         }
-        if (Baritone.settings().schematicOrientationY.value) {
-            y += schematic.heightY();
-        }
-        if (Baritone.settings().schematicOrientationZ.value) {
-            z += schematic.lengthZ();
-        }
-        this.origin = new Vec3i(x, y, z);
-        this.paused = false;
-        this.layer = Baritone.settings().startAtLayer.value;
-        this.numRepeats = 0;
-        this.observedCompleted = new LongOpenHashSet();
     }
 
-    public void resume() {
-        paused = false;
-    }
-
-    public void pause() {
-        paused = true;
+    protected void initRemoteRegionRegistry() throws MalformedURLException {
+        Map<String, String> remoteRegionUrlsWithName = serverConfig.getRemoteRegionUrlsWithName();
+        if (!remoteRegionUrlsWithName.isEmpty()) {
+            allKnownRemoteRegions = new String[remoteRegionUrlsWithName.size()];
+            int remoteRegionArrayIndex = 0;
+            for (Map.Entry<String, String> remoteRegionUrlWithName : remoteRegionUrlsWithName.entrySet()) {
+                RemoteRegionRegistry remoteRegionRegistry = new RemoteRegionRegistry(
+                        serverConfig,
+                        clientConfig,
+                        serverCodecs,
+                        remoteRegionUrlWithName.getKey(),
+                        new URL(remoteRegionUrlWithName.getValue()));
+                regionNameVSRemoteRegistry.put(remoteRegionUrlWithName.getKey(), remoteRegionRegistry);
+                allKnownRemoteRegions[remoteRegionArrayIndex++] = remoteRegionUrlWithName.getKey();
+            }
+        }
+        logger.info("Finished initializing remote region registries. All known remote regions: {}",
+                (Object) allKnownRemoteRegions);
     }
 
     @Override
-    public boolean isPaused() {
-        return paused;
+    public ResponseCache getResponseCache() {
+        return responseCache;
     }
 
-    @Override
-    public boolean build(String name, File schematic, Vec3i origin) {
-        Optional<ISchematicFormat> format = SchematicSystem.INSTANCE.getByFile(schematic);
-        if (!format.isPresent()) {
-            return false;
+    public long getLocalRegistrySize() {
+        long total = 0;
+        for (Map<String, Lease<InstanceInfo>> entry : registry.values()) {
+            total += entry.size();
         }
+        return total;
+    }
 
-        ISchematic parsed;
+    /**
+     * Completely clear the registry.
+     */
+    @Override
+    public void clearRegistry() {
+        overriddenInstanceStatusMap.clear();
+        recentCanceledQueue.clear();
+        recentRegisteredQueue.clear();
+        recentlyChangedQueue.clear();
+        registry.clear();
+    }
+
+    // for server info use
+    @Override
+    public Map<String, InstanceStatus> overriddenInstanceStatusesSnapshot() {
+        return new HashMap<>(overriddenInstanceStatusMap);
+    }
+
+    /**
+     * Registers a new instance with a given duration.
+     *
+     * @see com.netflix.eureka.lease.LeaseManager#register(java.lang.Object, int, boolean)
+     */
+    public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication) {
+        read.lock();
         try {
-            parsed = format.get().parse(new FileInputStream(schematic));
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(registrant.getAppName());
+            REGISTER.increment(isReplication);
+            if (gMap == null) {
+                final ConcurrentHashMap<String, Lease<InstanceInfo>> gNewMap = new ConcurrentHashMap<String, Lease<InstanceInfo>>();
+                gMap = registry.putIfAbsent(registrant.getAppName(), gNewMap);
+                if (gMap == null) {
+                    gMap = gNewMap;
+                }
+            }
+            Lease<InstanceInfo> existingLease = gMap.get(registrant.getId());
+            // Retain the last dirty timestamp without overwriting it, if there is already a lease
+            if (existingLease != null && (existingLease.getHolder() != null)) {
+                Long existingLastDirtyTimestamp = existingLease.getHolder().getLastDirtyTimestamp();
+                Long registrationLastDirtyTimestamp = registrant.getLastDirtyTimestamp();
+                logger.debug("Existing lease found (existing={}, provided={}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
+
+                // this is a > instead of a >= because if the timestamps are equal, we still take the remote transmitted
+                // InstanceInfo instead of the server local copy.
+                if (existingLastDirtyTimestamp > registrationLastDirtyTimestamp) {
+                    logger.warn("There is an existing lease and the existing lease's dirty timestamp {} is greater" +
+                            " than the one that is being registered {}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
+                    logger.warn("Using the existing instanceInfo instead of the new instanceInfo as the registrant");
+                    registrant = existingLease.getHolder();
+                }
+            } else {
+                // The lease does not exist and hence it is a new registration
+                synchronized (lock) {
+                    if (this.expectedNumberOfClientsSendingRenews > 0) {
+                        // Since the client wants to register it, increase the number of clients sending renews
+                        this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews + 1;
+                        updateRenewsPerMinThreshold();
+                    }
+                }
+                logger.debug("No previous lease information found; it is new registration");
+            }
+            Lease<InstanceInfo> lease = new Lease<InstanceInfo>(registrant, leaseDuration);
+            if (existingLease != null) {
+                lease.setServiceUpTimestamp(existingLease.getServiceUpTimestamp());
+            }
+            gMap.put(registrant.getId(), lease);
+            recentRegisteredQueue.add(new Pair<Long, String>(
+                    System.currentTimeMillis(),
+                    registrant.getAppName() + "(" + registrant.getId() + ")"));
+            // This is where the initial state transfer of overridden status happens
+            if (!InstanceStatus.UNKNOWN.equals(registrant.getOverriddenStatus())) {
+                logger.debug("Found overridden status {} for instance {}. Checking to see if needs to be add to the "
+                                + "overrides", registrant.getOverriddenStatus(), registrant.getId());
+                if (!overriddenInstanceStatusMap.containsKey(registrant.getId())) {
+                    logger.info("Not found overridden id {} and hence adding it", registrant.getId());
+                    overriddenInstanceStatusMap.put(registrant.getId(), registrant.getOverriddenStatus());
+                }
+            }
+            InstanceStatus overriddenStatusFromMap = overriddenInstanceStatusMap.get(registrant.getId());
+            if (overriddenStatusFromMap != null) {
+                logger.info("Storing overridden status {} from map", overriddenStatusFromMap);
+                registrant.setOverriddenStatus(overriddenStatusFromMap);
+            }
+
+            // Set the status based on the overridden status rules
+            InstanceStatus overriddenInstanceStatus = getOverriddenInstanceStatus(registrant, existingLease, isReplication);
+            registrant.setStatusWithoutDirty(overriddenInstanceStatus);
+
+            // If the lease is registered with UP status, set lease service up timestamp
+            if (InstanceStatus.UP.equals(registrant.getStatus())) {
+                lease.serviceUp();
+            }
+            registrant.setActionType(ActionType.ADDED);
+            recentlyChangedQueue.add(new RecentlyChangedItem(lease));
+            registrant.setLastUpdatedTimestamp();
+            invalidateCache(registrant.getAppName(), registrant.getVIPAddress(), registrant.getSecureVipAddress());
+            logger.info("Registered instance {}/{} with status {} (replication={})",
+                    registrant.getAppName(), registrant.getId(), registrant.getStatus(), isReplication);
+        } finally {
+            read.unlock();
+        }
+    }
+
+    /**
+     * Cancels the registration of an instance.
+     *
+     * <p>
+     * This is normally invoked by a client when it shuts down informing the
+     * server to remove the instance from traffic.
+     * </p>
+     *
+     * @param appName the application name of the application.
+     * @param id the unique identifier of the instance.
+     * @param isReplication true if this is a replication event from other nodes, false
+     *                      otherwise.
+     * @return true if the instance was removed from the {@link AbstractInstanceRegistry} successfully, false otherwise.
+     */
+    @Override
+    public boolean cancel(String appName, String id, boolean isReplication) {
+        return internalCancel(appName, id, isReplication);
+    }
+
+    /**
+     * {@link #cancel(String, String, boolean)} method is overridden by {@link PeerAwareInstanceRegistry}, so each
+     * cancel request is replicated to the peers. This is however not desired for expires which would be counted
+     * in the remote peers as valid cancellations, so self preservation mode would not kick-in.
+     */
+    protected boolean internalCancel(String appName, String id, boolean isReplication) {
+        read.lock();
+        try {
+            CANCEL.increment(isReplication);
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+            Lease<InstanceInfo> leaseToCancel = null;
+            if (gMap != null) {
+                leaseToCancel = gMap.remove(id);
+            }
+            recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));
+            InstanceStatus instanceStatus = overriddenInstanceStatusMap.remove(id);
+            if (instanceStatus != null) {
+                logger.debug("Removed instance id {} from the overridden map which has value {}", id, instanceStatus.name());
+            }
+            if (leaseToCancel == null) {
+                CANCEL_NOT_FOUND.increment(isReplication);
+                logger.warn("DS: Registry: cancel failed because Lease is not registered for: {}/{}", appName, id);
+                return false;
+            } else {
+                leaseToCancel.cancel();
+                InstanceInfo instanceInfo = leaseToCancel.getHolder();
+                String vip = null;
+                String svip = null;
+                if (instanceInfo != null) {
+                    instanceInfo.setActionType(ActionType.DELETED);
+                    recentlyChangedQueue.add(new RecentlyChangedItem(leaseToCancel));
+                    instanceInfo.setLastUpdatedTimestamp();
+                    vip = instanceInfo.getVIPAddress();
+                    svip = instanceInfo.getSecureVipAddress();
+                }
+                invalidateCache(appName, vip, svip);
+                logger.info("Cancelled instance {}/{} (replication={})", appName, id, isReplication);
+            }
+        } finally {
+            read.unlock();
         }
 
-        if (Baritone.settings().mapArtMode.value) {
-            parsed = new MapArtSchematic((IStaticSchematic) parsed);
+        synchronized (lock) {
+            if (this.expectedNumberOfClientsSendingRenews > 0) {
+                // Since the client wants to cancel it, reduce the number of clients to send renews.
+                this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews - 1;
+                updateRenewsPerMinThreshold();
+            }
         }
 
-        build(name, parsed, origin);
         return true;
     }
 
-    @Override
-    public void buildOpenSchematic() {
-        if (SchematicaHelper.isSchematicaPresent()) {
-            Optional<Tuple<IStaticSchematic, BlockPos>> schematic = SchematicaHelper.getOpenSchematic();
-            if (schematic.isPresent()) {
-                IStaticSchematic s = schematic.get().getFirst();
-                this.build(
-                        schematic.get().getFirst().toString(),
-                        Baritone.settings().mapArtMode.value ? new MapArtSchematic(s) : s,
-                        schematic.get().getSecond()
-                );
-            } else {
-                logDirect("No schematic currently open");
-            }
+    /**
+     * Marks the given instance of the given app name as renewed, and also marks whether it originated from
+     * replication.
+     *
+     * @see com.netflix.eureka.lease.LeaseManager#renew(java.lang.String, java.lang.String, boolean)
+     */
+    public boolean renew(String appName, String id, boolean isReplication) {
+        RENEW.increment(isReplication);
+        Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+        Lease<InstanceInfo> leaseToRenew = null;
+        if (gMap != null) {
+            leaseToRenew = gMap.get(id);
+        }
+        if (leaseToRenew == null) {
+            RENEW_NOT_FOUND.increment(isReplication);
+            logger.warn("DS: Registry: lease doesn't exist, registering resource: {} - {}", appName, id);
+            return false;
         } else {
-            logDirect("Schematica is not present");
+            InstanceInfo instanceInfo = leaseToRenew.getHolder();
+            if (instanceInfo != null) {
+                // touchASGCache(instanceInfo.getASGName());
+                InstanceStatus overriddenInstanceStatus = this.getOverriddenInstanceStatus(
+                        instanceInfo, leaseToRenew, isReplication);
+                if (overriddenInstanceStatus == InstanceStatus.UNKNOWN) {
+                    logger.info("Instance status UNKNOWN possibly due to deleted override for instance {}"
+                            + "; re-register required", instanceInfo.getId());
+                    RENEW_NOT_FOUND.increment(isReplication);
+                    return false;
+                }
+                if (!instanceInfo.getStatus().equals(overriddenInstanceStatus)) {
+                    logger.info(
+                            "The instance status {} is different from overridden instance status {} for instance {}. "
+                                    + "Hence setting the status to overridden status", instanceInfo.getStatus().name(),
+                                    overriddenInstanceStatus.name(),
+                                    instanceInfo.getId());
+                    instanceInfo.setStatusWithoutDirty(overriddenInstanceStatus);
+
+                }
+            }
+            renewsLastMin.increment();
+            leaseToRenew.renew();
+            return true;
         }
     }
 
-    public void clearArea(BlockPos corner1, BlockPos corner2) {
-        BlockPos origin = new BlockPos(Math.min(corner1.getX(), corner2.getX()), Math.min(corner1.getY(), corner2.getY()), Math.min(corner1.getZ(), corner2.getZ()));
-        int widthX = Math.abs(corner1.getX() - corner2.getX()) + 1;
-        int heightY = Math.abs(corner1.getY() - corner2.getY()) + 1;
-        int lengthZ = Math.abs(corner1.getZ() - corner2.getZ()) + 1;
-        build("clear area", new FillSchematic(widthX, heightY, lengthZ, Blocks.AIR.getDefaultState()), origin);
-    }
-
+    /**
+     * @deprecated this is expensive, try not to use. See if you can use
+     * {@link #storeOverriddenStatusIfRequired(String, String, InstanceStatus)} instead.
+     *
+     * Stores overridden status if it is not already there. This happens during
+     * a reconciliation process during renewal requests.
+     *
+     * @param id the unique identifier of the instance.
+     * @param overriddenStatus Overridden status if any.
+     */
+    @Deprecated
     @Override
-    public List<IBlockState> getApproxPlaceable() {
-        return new ArrayList<>(approxPlaceable);
+    public void storeOverriddenStatusIfRequired(String id, InstanceStatus overriddenStatus) {
+        InstanceStatus instanceStatus = overriddenInstanceStatusMap.get(id);
+        if ((instanceStatus == null)
+                || (!overriddenStatus.equals(instanceStatus))) {
+            // We might not have the overridden status if the server got restarted -this will help us maintain
+            // the overridden state from the replica
+            logger.info(
+                    "Adding overridden status for instance id {} and the value is {}",
+                    id, overriddenStatus.name());
+            overriddenInstanceStatusMap.put(id, overriddenStatus);
+            List<InstanceInfo> instanceInfo = this.getInstancesById(id, false);
+            if ((instanceInfo != null) && (!instanceInfo.isEmpty())) {
+                instanceInfo.iterator().next().setOverriddenStatus(overriddenStatus);
+                logger.info(
+                        "Setting the overridden status for instance id {} and the value is {} ",
+                        id, overriddenStatus.name());
+
+            }
+        }
     }
 
+    /**
+     * Stores overridden status if it is not already there. This happens during
+     * a reconciliation process during renewal requests.
+     *
+     * @param appName the application name of the instance.
+     * @param id the unique identifier of the instance.
+     * @param overriddenStatus overridden status if any.
+     */
     @Override
-    public boolean isActive() {
-        return schematic != null;
-    }
-
-    public IBlockState placeAt(int x, int y, int z, IBlockState current) {
-        if (!isActive()) {
-            return null;
-        }
-        if (!schematic.inSchematic(x - origin.getX(), y - origin.getY(), z - origin.getZ(), current)) {
-            return null;
-        }
-        IBlockState state = schematic.desiredState(x - origin.getX(), y - origin.getY(), z - origin.getZ(), current, this.approxPlaceable);
-        if (state.getBlock() == Blocks.AIR) {
-            return null;
-        }
-        return state;
-    }
-
-    private Optional<Tuple<BetterBlockPos, Rotation>> toBreakNearPlayer(BuilderCalculationContext bcc) {
-        BetterBlockPos center = ctx.playerFeet();
-        BetterBlockPos pathStart = baritone.getPathingBehavior().pathStart();
-        for (int dx = -5; dx <= 5; dx++) {
-            for (int dy = Baritone.settings().breakFromAbove.value ? -1 : 0; dy <= 5; dy++) {
-                for (int dz = -5; dz <= 5; dz++) {
-                    int x = center.x + dx;
-                    int y = center.y + dy;
-                    int z = center.z + dz;
-                    if (dy == -1 && x == pathStart.x && z == pathStart.z) {
-                        continue; // dont mine what we're supported by, but not directly standing on
-                    }
-                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
-                    if (desired == null) {
-                        continue; // irrelevant
-                    }
-                    IBlockState curr = bcc.bsi.get0(x, y, z);
-                    if (curr.getBlock() != Blocks.AIR && !(curr.getBlock() instanceof BlockLiquid) && !valid(curr, desired, false)) {
-                        BetterBlockPos pos = new BetterBlockPos(x, y, z);
-                        Optional<Rotation> rot = RotationUtils.reachable(ctx.player(), pos, ctx.playerController().getBlockReachDistance());
-                        if (rot.isPresent()) {
-                            return Optional.of(new Tuple<>(pos, rot.get()));
-                        }
-                    }
-                }
-            }
-        }
-        return Optional.empty();
-    }
-
-    public static class Placement {
-
-        private final int hotbarSelection;
-        private final BlockPos placeAgainst;
-        private final EnumFacing side;
-        private final Rotation rot;
-
-        public Placement(int hotbarSelection, BlockPos placeAgainst, EnumFacing side, Rotation rot) {
-            this.hotbarSelection = hotbarSelection;
-            this.placeAgainst = placeAgainst;
-            this.side = side;
-            this.rot = rot;
+    public void storeOverriddenStatusIfRequired(String appName, String id, InstanceStatus overriddenStatus) {
+        InstanceStatus instanceStatus = overriddenInstanceStatusMap.get(id);
+        if ((instanceStatus == null) || (!overriddenStatus.equals(instanceStatus))) {
+            // We might not have the overridden status if the server got
+            // restarted -this will help us maintain the overridden state
+            // from the replica
+            logger.info("Adding overridden status for instance id {} and the value is {}",
+                    id, overriddenStatus.name());
+            overriddenInstanceStatusMap.put(id, overriddenStatus);
+            InstanceInfo instanceInfo = this.getInstanceByAppAndId(appName, id, false);
+            instanceInfo.setOverriddenStatus(overriddenStatus);
+            logger.info("Set the overridden status for instance (appname:{}, id:{}} and the value is {} ",
+                    appName, id, overriddenStatus.name());
         }
     }
 
-    private Optional<Placement> searchForPlaceables(BuilderCalculationContext bcc, List<IBlockState> desirableOnHotbar) {
-        BetterBlockPos center = ctx.playerFeet();
-        for (int dx = -5; dx <= 5; dx++) {
-            for (int dy = -5; dy <= 1; dy++) {
-                for (int dz = -5; dz <= 5; dz++) {
-                    int x = center.x + dx;
-                    int y = center.y + dy;
-                    int z = center.z + dz;
-                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
-                    if (desired == null) {
-                        continue; // irrelevant
-                    }
-                    IBlockState curr = bcc.bsi.get0(x, y, z);
-                    if (MovementHelper.isReplaceable(x, y, z, curr, bcc.bsi) && !valid(curr, desired, false)) {
-                        if (dy == 1 && bcc.bsi.get0(x, y + 1, z).getBlock() == Blocks.AIR) {
-                            continue;
-                        }
-                        desirableOnHotbar.add(desired);
-                        Optional<Placement> opt = possibleToPlace(desired, x, y, z, bcc.bsi);
-                        if (opt.isPresent()) {
-                            return opt;
-                        }
-                    }
-                }
-            }
-        }
-        return Optional.empty();
-    }
-
-    private Optional<Placement> possibleToPlace(IBlockState toPlace, int x, int y, int z, BlockStateInterface bsi) {
-        for (EnumFacing against : EnumFacing.values()) {
-            BetterBlockPos placeAgainstPos = new BetterBlockPos(x, y, z).offset(against);
-            IBlockState placeAgainstState = bsi.get0(placeAgainstPos);
-            if (MovementHelper.isReplaceable(placeAgainstPos.x, placeAgainstPos.y, placeAgainstPos.z, placeAgainstState, bsi)) {
-                continue;
-            }
-            if (!ctx.world().mayPlace(toPlace.getBlock(), new BetterBlockPos(x, y, z), false, against, null)) {
-                continue;
-            }
-            AxisAlignedBB aabb = placeAgainstState.getBoundingBox(ctx.world(), placeAgainstPos);
-            for (Vec3d placementMultiplier : aabbSideMultipliers(against)) {
-                double placeX = placeAgainstPos.x + aabb.minX * placementMultiplier.x + aabb.maxX * (1 - placementMultiplier.x);
-                double placeY = placeAgainstPos.y + aabb.minY * placementMultiplier.y + aabb.maxY * (1 - placementMultiplier.y);
-                double placeZ = placeAgainstPos.z + aabb.minZ * placementMultiplier.z + aabb.maxZ * (1 - placementMultiplier.z);
-                Rotation rot = RotationUtils.calcRotationFromVec3d(RayTraceUtils.inferSneakingEyePosition(ctx.player()), new Vec3d(placeX, placeY, placeZ), ctx.playerRotations());
-                RayTraceResult result = RayTraceUtils.rayTraceTowards(ctx.player(), rot, ctx.playerController().getBlockReachDistance(), true);
-                if (result != null && result.typeOfHit == RayTraceResult.Type.BLOCK && result.getBlockPos().equals(placeAgainstPos) && result.sideHit == against.getOpposite()) {
-                    OptionalInt hotbar = hasAnyItemThatWouldPlace(toPlace, result, rot);
-                    if (hotbar.isPresent()) {
-                        return Optional.of(new Placement(hotbar.getAsInt(), placeAgainstPos, against.getOpposite(), rot));
-                    }
-                }
-            }
-        }
-        return Optional.empty();
-    }
-
-    private OptionalInt hasAnyItemThatWouldPlace(IBlockState desired, RayTraceResult result, Rotation rot) {
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = ctx.player().inventory.mainInventory.get(i);
-            if (stack.isEmpty() || !(stack.getItem() instanceof ItemBlock)) {
-                continue;
-            }
-            float originalYaw = ctx.player().rotationYaw;
-            float originalPitch = ctx.player().rotationPitch;
-            // the state depends on the facing of the player sometimes
-            ctx.player().rotationYaw = rot.getYaw();
-            ctx.player().rotationPitch = rot.getPitch();
-            IBlockState wouldBePlaced = ((ItemBlock) stack.getItem()).getBlock().getStateForPlacement(
-                    ctx.world(),
-                    result.getBlockPos().offset(result.sideHit),
-                    result.sideHit,
-                    (float) result.hitVec.x - result.getBlockPos().getX(), // as in PlayerControllerMP
-                    (float) result.hitVec.y - result.getBlockPos().getY(),
-                    (float) result.hitVec.z - result.getBlockPos().getZ(),
-                    stack.getItem().getMetadata(stack.getMetadata()),
-                    ctx.player()
-            );
-            ctx.player().rotationYaw = originalYaw;
-            ctx.player().rotationPitch = originalPitch;
-            if (valid(wouldBePlaced, desired, true)) {
-                return OptionalInt.of(i);
-            }
-        }
-        return OptionalInt.empty();
-    }
-
-    private static Vec3d[] aabbSideMultipliers(EnumFacing side) {
-        switch (side) {
-            case UP:
-                return new Vec3d[]{new Vec3d(0.5, 1, 0.5), new Vec3d(0.1, 1, 0.5), new Vec3d(0.9, 1, 0.5), new Vec3d(0.5, 1, 0.1), new Vec3d(0.5, 1, 0.9)};
-            case DOWN:
-                return new Vec3d[]{new Vec3d(0.5, 0, 0.5), new Vec3d(0.1, 0, 0.5), new Vec3d(0.9, 0, 0.5), new Vec3d(0.5, 0, 0.1), new Vec3d(0.5, 0, 0.9)};
-            case NORTH:
-            case SOUTH:
-            case EAST:
-            case WEST:
-                double x = side.getXOffset() == 0 ? 0.5 : (1 + side.getXOffset()) / 2D;
-                double z = side.getZOffset() == 0 ? 0.5 : (1 + side.getZOffset()) / 2D;
-                return new Vec3d[]{new Vec3d(x, 0.25, z), new Vec3d(x, 0.75, z)};
-            default: // null
-                throw new IllegalStateException();
-        }
-    }
-
+    /**
+     * Updates the status of an instance. Normally happens to put an instance
+     * between {@link InstanceStatus#OUT_OF_SERVICE} and
+     * {@link InstanceStatus#UP} to put the instance in and out of traffic.
+     *
+     * @param appName the application name of the instance.
+     * @param id the unique identifier of the instance.
+     * @param newStatus the new {@link InstanceStatus}.
+     * @param lastDirtyTimestamp last timestamp when this instance information was updated.
+     * @param isReplication true if this is a replication event from other nodes, false
+     *                      otherwise.
+     * @return true if the status was successfully updated, false otherwise.
+     */
     @Override
-    public PathingCommand onTick(boolean calcFailed, boolean isSafeToCancel) {
-        approxPlaceable = approxPlaceable(36);
-        if (baritone.getInputOverrideHandler().isInputForcedDown(Input.CLICK_LEFT)) {
-            ticks = 5;
-        } else {
-            ticks--;
-        }
-        baritone.getInputOverrideHandler().clearAllKeys();
-        if (paused) {
-            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
-        }
-        if (Baritone.settings().buildInLayers.value) {
-            if (realSchematic == null) {
-                realSchematic = schematic;
+    public boolean statusUpdate(String appName, String id,
+                                InstanceStatus newStatus, String lastDirtyTimestamp,
+                                boolean isReplication) {
+        read.lock();
+        try {
+            STATUS_UPDATE.increment(isReplication);
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+            Lease<InstanceInfo> lease = null;
+            if (gMap != null) {
+                lease = gMap.get(id);
             }
-            ISchematic realSchematic = this.realSchematic; // wrap this properly, dont just have the inner class refer to the builderprocess.this
-            int minYInclusive;
-            int maxYInclusive;
-            // layer = 0 should be nothing
-            // layer = realSchematic.heightY() should be everything
-            if (Baritone.settings().layerOrder.value) { // top to bottom
-                maxYInclusive = realSchematic.heightY() - 1;
-                minYInclusive = realSchematic.heightY() - layer;
-            } else {
-                maxYInclusive = layer - 1;
-                minYInclusive = 0;
-            }
-            schematic = new ISchematic() {
-                @Override
-                public IBlockState desiredState(int x, int y, int z, IBlockState current, List<IBlockState> approxPlaceable) {
-                    return realSchematic.desiredState(x, y, z, current, BuilderProcess.this.approxPlaceable);
-                }
-
-                @Override
-                public boolean inSchematic(int x, int y, int z, IBlockState currentState) {
-                    return ISchematic.super.inSchematic(x, y, z, currentState) && y >= minYInclusive && y <= maxYInclusive && realSchematic.inSchematic(x, y, z, currentState);
-                }
-
-                @Override
-                public int widthX() {
-                    return realSchematic.widthX();
-                }
-
-                @Override
-                public int heightY() {
-                    return realSchematic.heightY();
-                }
-
-                @Override
-                public int lengthZ() {
-                    return realSchematic.lengthZ();
-                }
-            };
-        }
-        BuilderCalculationContext bcc = new BuilderCalculationContext();
-        if (!recalc(bcc)) {
-            if (Baritone.settings().buildInLayers.value && layer < realSchematic.heightY()) {
-                logDirect("Starting layer " + layer);
-                layer++;
-                return onTick(calcFailed, isSafeToCancel);
-            }
-            Vec3i repeat = Baritone.settings().buildRepeat.value;
-            int max = Baritone.settings().buildRepeatCount.value;
-            numRepeats++;
-            if (repeat.equals(new Vec3i(0, 0, 0)) || (max != -1 && numRepeats >= max)) {
-                logDirect("Done building");
-                if (Baritone.settings().desktopNotifications.value && Baritone.settings().notificationOnBuildFinished.value) {
-                    NotificationHelper.notify("Done building", false);
-                }
-                onLostControl();
-                return null;
-            }
-            // build repeat time
-            layer = 0;
-            origin = new BlockPos(origin).add(repeat);
-            logDirect("Repeating build in vector " + repeat + ", new origin is " + origin);
-            return onTick(calcFailed, isSafeToCancel);
-        }
-        if (Baritone.settings().distanceTrim.value) {
-            trim();
-        }
-
-        Optional<Tuple<BetterBlockPos, Rotation>> toBreak = toBreakNearPlayer(bcc);
-        if (toBreak.isPresent() && isSafeToCancel && ctx.player().onGround) {
-            // we'd like to pause to break this block
-            // only change look direction if it's safe (don't want to fuck up an in progress parkour for example
-            Rotation rot = toBreak.get().getSecond();
-            BetterBlockPos pos = toBreak.get().getFirst();
-            baritone.getLookBehavior().updateTarget(rot, true);
-            MovementHelper.switchToBestToolFor(ctx, bcc.get(pos));
-            if (ctx.player().isSneaking()) {
-                // really horrible bug where a block is visible for breaking while sneaking but not otherwise
-                // so you can't see it, it goes to place something else, sneaks, then the next tick it tries to break
-                // and is unable since it's unsneaked in the intermediary tick
-                baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
-            }
-            if (ctx.isLookingAt(pos) || ctx.playerRotations().isReallyCloseTo(rot)) {
-                baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_LEFT, true);
-            }
-            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
-        }
-        List<IBlockState> desirableOnHotbar = new ArrayList<>();
-        Optional<Placement> toPlace = searchForPlaceables(bcc, desirableOnHotbar);
-        if (toPlace.isPresent() && isSafeToCancel && ctx.player().onGround && ticks <= 0) {
-            Rotation rot = toPlace.get().rot;
-            baritone.getLookBehavior().updateTarget(rot, true);
-            ctx.player().inventory.currentItem = toPlace.get().hotbarSelection;
-            baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
-            if ((ctx.isLookingAt(toPlace.get().placeAgainst) && ctx.objectMouseOver().sideHit.equals(toPlace.get().side)) || ctx.playerRotations().isReallyCloseTo(rot)) {
-                baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
-            }
-            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
-        }
-
-        if (Baritone.settings().allowInventory.value) {
-            ArrayList<Integer> usefulSlots = new ArrayList<>();
-            List<IBlockState> noValidHotbarOption = new ArrayList<>();
-            outer:
-            for (IBlockState desired : desirableOnHotbar) {
-                for (int i = 0; i < 9; i++) {
-                    if (valid(approxPlaceable.get(i), desired, true)) {
-                        usefulSlots.add(i);
-                        continue outer;
-                    }
-                }
-                noValidHotbarOption.add(desired);
-            }
-
-            outer:
-            for (int i = 9; i < 36; i++) {
-                for (IBlockState desired : noValidHotbarOption) {
-                    if (valid(approxPlaceable.get(i), desired, true)) {
-                        baritone.getInventoryBehavior().attemptToPutOnHotbar(i, usefulSlots::contains);
-                        break outer;
-                    }
-                }
-            }
-        }
-
-        Goal goal = assemble(bcc, approxPlaceable.subList(0, 9));
-        if (goal == null) {
-            goal = assemble(bcc, approxPlaceable, true); // we're far away, so assume that we have our whole inventory to recalculate placeable properly
-            if (goal == null) {
-                if (Baritone.settings().skipFailedLayers.value && Baritone.settings().buildInLayers.value && layer < realSchematic.heightY()) {
-                    logDirect("Skipping layer that I cannot construct! Layer #" + layer);
-                    layer++;
-                    return onTick(calcFailed, isSafeToCancel);
-                }
-                logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
-                paused = true;
-                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
-            }
-        }
-        return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
-    }
-
-    private boolean recalc(BuilderCalculationContext bcc) {
-        if (incorrectPositions == null) {
-            incorrectPositions = new HashSet<>();
-            fullRecalc(bcc);
-            if (incorrectPositions.isEmpty()) {
+            if (lease == null) {
                 return false;
+            } else {
+                lease.renew();
+                InstanceInfo info = lease.getHolder();
+                // Lease is always created with its instance info object.
+                // This log statement is provided as a safeguard, in case this invariant is violated.
+                if (info == null) {
+                    logger.error("Found Lease without a holder for instance id {}", id);
+                }
+                if ((info != null) && !(info.getStatus().equals(newStatus))) {
+                    // Mark service as UP if needed
+                    if (InstanceStatus.UP.equals(newStatus)) {
+                        lease.serviceUp();
+                    }
+                    // This is NAC overridden status
+                    overriddenInstanceStatusMap.put(id, newStatus);
+                    // Set it for transfer of overridden status to replica on
+                    // replica start up
+                    info.setOverriddenStatus(newStatus);
+                    long replicaDirtyTimestamp = 0;
+                    info.setStatusWithoutDirty(newStatus);
+                    if (lastDirtyTimestamp != null) {
+                        replicaDirtyTimestamp = Long.parseLong(lastDirtyTimestamp);
+                    }
+                    // If the replication's dirty timestamp is more than the existing one, just update
+                    // it to the replica's.
+                    if (replicaDirtyTimestamp > info.getLastDirtyTimestamp()) {
+                        info.setLastDirtyTimestamp(replicaDirtyTimestamp);
+                    }
+                    info.setActionType(ActionType.MODIFIED);
+                    recentlyChangedQueue.add(new RecentlyChangedItem(lease));
+                    info.setLastUpdatedTimestamp();
+                    invalidateCache(appName, info.getVIPAddress(), info.getSecureVipAddress());
+                }
+                return true;
             }
-        }
-        recalcNearby(bcc);
-        if (incorrectPositions.isEmpty()) {
-            fullRecalc(bcc);
-        }
-        return !incorrectPositions.isEmpty();
-    }
-
-    private void trim() {
-        HashSet<BetterBlockPos> copy = new HashSet<>(incorrectPositions);
-        copy.removeIf(pos -> pos.distanceSq(ctx.player().posX, ctx.player().posY, ctx.player().posZ) > 200);
-        if (!copy.isEmpty()) {
-            incorrectPositions = copy;
+        } finally {
+            read.unlock();
         }
     }
 
-    private void recalcNearby(BuilderCalculationContext bcc) {
-        BetterBlockPos center = ctx.playerFeet();
-        int radius = Baritone.settings().builderTickScanRadius.value;
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dy = -radius; dy <= radius; dy++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    int x = center.x + dx;
-                    int y = center.y + dy;
-                    int z = center.z + dz;
-                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
-                    if (desired != null) {
-                        // we care about this position
-                        BetterBlockPos pos = new BetterBlockPos(x, y, z);
-                        if (valid(bcc.bsi.get0(x, y, z), desired, false)) {
-                            incorrectPositions.remove(pos);
-                            observedCompleted.add(BetterBlockPos.longHash(pos));
-                        } else {
-                            incorrectPositions.add(pos);
-                            observedCompleted.remove(BetterBlockPos.longHash(pos));
-                        }
+    /**
+     * Removes status override for a give instance.
+     *
+     * @param appName the application name of the instance.
+     * @param id the unique identifier of the instance.
+     * @param newStatus the new {@link InstanceStatus}.
+     * @param lastDirtyTimestamp last timestamp when this instance information was updated.
+     * @param isReplication true if this is a replication event from other nodes, false
+     *                      otherwise.
+     * @return true if the status was successfully updated, false otherwise.
+     */
+    @Override
+    public boolean deleteStatusOverride(String appName, String id,
+                                        InstanceStatus newStatus,
+                                        String lastDirtyTimestamp,
+                                        boolean isReplication) {
+        read.lock();
+        try {
+            STATUS_OVERRIDE_DELETE.increment(isReplication);
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+            Lease<InstanceInfo> lease = null;
+            if (gMap != null) {
+                lease = gMap.get(id);
+            }
+            if (lease == null) {
+                return false;
+            } else {
+                lease.renew();
+                InstanceInfo info = lease.getHolder();
+
+                // Lease is always created with its instance info object.
+                // This log statement is provided as a safeguard, in case this invariant is violated.
+                if (info == null) {
+                    logger.error("Found Lease without a holder for instance id {}", id);
+                }
+
+                InstanceStatus currentOverride = overriddenInstanceStatusMap.remove(id);
+                if (currentOverride != null && info != null) {
+                    info.setOverriddenStatus(InstanceStatus.UNKNOWN);
+                    info.setStatusWithoutDirty(newStatus);
+                    long replicaDirtyTimestamp = 0;
+                    if (lastDirtyTimestamp != null) {
+                        replicaDirtyTimestamp = Long.parseLong(lastDirtyTimestamp);
+                    }
+                    // If the replication's dirty timestamp is more than the existing one, just update
+                    // it to the replica's.
+                    if (replicaDirtyTimestamp > info.getLastDirtyTimestamp()) {
+                        info.setLastDirtyTimestamp(replicaDirtyTimestamp);
+                    }
+                    info.setActionType(ActionType.MODIFIED);
+                    recentlyChangedQueue.add(new RecentlyChangedItem(lease));
+                    info.setLastUpdatedTimestamp();
+                    invalidateCache(appName, info.getVIPAddress(), info.getSecureVipAddress());
+                }
+                return true;
+            }
+        } finally {
+            read.unlock();
+        }
+    }
+
+    /**
+     * Evicts everything in the instance registry that has expired, if expiry is enabled.
+     *
+     * @see com.netflix.eureka.lease.LeaseManager#evict()
+     */
+    @Override
+    public void evict() {
+        evict(0l);
+    }
+
+    public void evict(long additionalLeaseMs) {
+        logger.debug("Running the evict task");
+
+        if (!isLeaseExpirationEnabled()) {
+            logger.debug("DS: lease expiration is currently disabled.");
+            return;
+        }
+
+        // We collect first all expired items, to evict them in random order. For large eviction sets,
+        // if we do not that, we might wipe out whole apps before self preservation kicks in. By randomizing it,
+        // the impact should be evenly distributed across all applications.
+        List<Lease<InstanceInfo>> expiredLeases = new ArrayList<>();
+        for (Entry<String, Map<String, Lease<InstanceInfo>>> groupEntry : registry.entrySet()) {
+            Map<String, Lease<InstanceInfo>> leaseMap = groupEntry.getValue();
+            if (leaseMap != null) {
+                for (Entry<String, Lease<InstanceInfo>> leaseEntry : leaseMap.entrySet()) {
+                    Lease<InstanceInfo> lease = leaseEntry.getValue();
+                    if (lease.isExpired(additionalLeaseMs) && lease.getHolder() != null) {
+                        expiredLeases.add(lease);
                     }
                 }
             }
         }
+
+        // To compensate for GC pauses or drifting local time, we need to use current registry size as a base for
+        // triggering self-preservation. Without that we would wipe out full registry.
+        int registrySize = (int) getLocalRegistrySize();
+        int registrySizeThreshold = (int) (registrySize * serverConfig.getRenewalPercentThreshold());
+        int evictionLimit = registrySize - registrySizeThreshold;
+
+        int toEvict = Math.min(expiredLeases.size(), evictionLimit);
+        if (toEvict > 0) {
+            logger.info("Evicting {} items (expired={}, evictionLimit={})", toEvict, expiredLeases.size(), evictionLimit);
+
+            Random random = new Random(System.currentTimeMillis());
+            for (int i = 0; i < toEvict; i++) {
+                // Pick a random item (Knuth shuffle algorithm)
+                int next = i + random.nextInt(expiredLeases.size() - i);
+                Collections.swap(expiredLeases, i, next);
+                Lease<InstanceInfo> lease = expiredLeases.get(i);
+
+                String appName = lease.getHolder().getAppName();
+                String id = lease.getHolder().getId();
+                EXPIRED.increment();
+                logger.warn("DS: Registry: expired lease for {}/{}", appName, id);
+                internalCancel(appName, id, false);
+            }
+        }
     }
 
-    private void fullRecalc(BuilderCalculationContext bcc) {
-        incorrectPositions = new HashSet<>();
-        for (int y = 0; y < schematic.heightY(); y++) {
-            for (int z = 0; z < schematic.lengthZ(); z++) {
-                for (int x = 0; x < schematic.widthX(); x++) {
-                    int blockX = x + origin.getX();
-                    int blockY = y + origin.getY();
-                    int blockZ = z + origin.getZ();
-                    IBlockState current = bcc.bsi.get0(blockX, blockY, blockZ);
-                    if (!schematic.inSchematic(x, y, z, current)) {
-                        continue;
+
+    /**
+     * Returns the given app that is in this instance only, falling back to other regions transparently only
+     * if specified in this client configuration.
+     *
+     * @param appName the application name of the application
+     * @return the application
+     *
+     * @see com.netflix.discovery.shared.LookupService#getApplication(java.lang.String)
+     */
+    @Override
+    public Application getApplication(String appName) {
+        boolean disableTransparentFallback = serverConfig.disableTransparentFallbackToOtherRegion();
+        return this.getApplication(appName, !disableTransparentFallback);
+    }
+
+    /**
+     * Get application information.
+     *
+     * @param appName The name of the application
+     * @param includeRemoteRegion true, if we need to include applications from remote regions
+     *                            as indicated by the region {@link URL} by this property
+     *                            {@link EurekaServerConfig#getRemoteRegionUrls()}, false otherwise
+     * @return the application
+     */
+    @Override
+    public Application getApplication(String appName, boolean includeRemoteRegion) {
+        Application app = null;
+
+        Map<String, Lease<InstanceInfo>> leaseMap = registry.get(appName);
+
+        if (leaseMap != null && leaseMap.size() > 0) {
+            for (Entry<String, Lease<InstanceInfo>> entry : leaseMap.entrySet()) {
+                if (app == null) {
+                    app = new Application(appName);
+                }
+                app.addInstance(decorateInstanceInfo(entry.getValue()));
+            }
+        } else if (includeRemoteRegion) {
+            for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                Application application = remoteRegistry.getApplication(appName);
+                if (application != null) {
+                    return application;
+                }
+            }
+        }
+        return app;
+    }
+
+    /**
+     * Get all applications in this instance registry, falling back to other regions if allowed in the Eureka config.
+     *
+     * @return the list of all known applications
+     *
+     * @see com.netflix.discovery.shared.LookupService#getApplications()
+     */
+    public Applications getApplications() {
+        boolean disableTransparentFallback = serverConfig.disableTransparentFallbackToOtherRegion();
+        if (disableTransparentFallback) {
+            return getApplicationsFromLocalRegionOnly();
+        } else {
+            return getApplicationsFromAllRemoteRegions();  // Behavior of falling back to remote region can be disabled.
+        }
+    }
+
+    /**
+     * Returns applications including instances from all remote regions. <br/>
+     * Same as calling {@link #getApplicationsFromMultipleRegions(String[])} with a <code>null</code> argument.
+     */
+    public Applications getApplicationsFromAllRemoteRegions() {
+        return getApplicationsFromMultipleRegions(allKnownRemoteRegions);
+    }
+
+    /**
+     * Returns applications including instances from local region only. <br/>
+     * Same as calling {@link #getApplicationsFromMultipleRegions(String[])} with an empty array.
+     */
+    @Override
+    public Applications getApplicationsFromLocalRegionOnly() {
+        return getApplicationsFromMultipleRegions(EMPTY_STR_ARRAY);
+    }
+
+    /**
+     * This method will return applications with instances from all passed remote regions as well as the current region.
+     * Thus, this gives a union view of instances from multiple regions. <br/>
+     * The application instances for which this union will be done can be restricted to the names returned by
+     * {@link EurekaServerConfig#getRemoteRegionAppWhitelist(String)} for every region. In case, there is no whitelist
+     * defined for a region, this method will also look for a global whitelist by passing <code>null</code> to the
+     * method {@link EurekaServerConfig#getRemoteRegionAppWhitelist(String)} <br/>
+     * If you are not selectively requesting for a remote region, use {@link #getApplicationsFromAllRemoteRegions()}
+     * or {@link #getApplicationsFromLocalRegionOnly()}
+     *
+     * @param remoteRegions The remote regions for which the instances are to be queried. The instances may be limited
+     *                      by a whitelist as explained above. If <code>null</code> or empty no remote regions are
+     *                      included.
+     *
+     * @return The applications with instances from the passed remote regions as well as local region. The instances
+     * from remote regions can be only for certain whitelisted apps as explained above.
+     */
+    public Applications getApplicationsFromMultipleRegions(String[] remoteRegions) {
+
+        boolean includeRemoteRegion = null != remoteRegions && remoteRegions.length != 0;
+
+        logger.debug("Fetching applications registry with remote regions: {}, Regions argument {}",
+                includeRemoteRegion, remoteRegions);
+
+        if (includeRemoteRegion) {
+            GET_ALL_WITH_REMOTE_REGIONS_CACHE_MISS.increment();
+        } else {
+            GET_ALL_CACHE_MISS.increment();
+        }
+        Applications apps = new Applications();
+        apps.setVersion(1L);
+        for (Entry<String, Map<String, Lease<InstanceInfo>>> entry : registry.entrySet()) {
+            Application app = null;
+
+            if (entry.getValue() != null) {
+                for (Entry<String, Lease<InstanceInfo>> stringLeaseEntry : entry.getValue().entrySet()) {
+                    Lease<InstanceInfo> lease = stringLeaseEntry.getValue();
+                    if (app == null) {
+                        app = new Application(lease.getHolder().getAppName());
                     }
-                    if (bcc.bsi.worldContainsLoadedChunk(blockX, blockZ)) { // check if its in render distance, not if its in cache
-                        // we can directly observe this block, it is in render distance
-                        if (valid(bcc.bsi.get0(blockX, blockY, blockZ), schematic.desiredState(x, y, z, current, this.approxPlaceable), false)) {
-                            observedCompleted.add(BetterBlockPos.longHash(blockX, blockY, blockZ));
+                    app.addInstance(decorateInstanceInfo(lease));
+                }
+            }
+            if (app != null) {
+                apps.addApplication(app);
+            }
+        }
+        if (includeRemoteRegion) {
+            for (String remoteRegion : remoteRegions) {
+                RemoteRegionRegistry remoteRegistry = regionNameVSRemoteRegistry.get(remoteRegion);
+                if (null != remoteRegistry) {
+                    Applications remoteApps = remoteRegistry.getApplications();
+                    for (Application application : remoteApps.getRegisteredApplications()) {
+                        if (shouldFetchFromRemoteRegistry(application.getName(), remoteRegion)) {
+                            logger.info("Application {}  fetched from the remote region {}",
+                                    application.getName(), remoteRegion);
+
+                            Application appInstanceTillNow = apps.getRegisteredApplications(application.getName());
+                            if (appInstanceTillNow == null) {
+                                appInstanceTillNow = new Application(application.getName());
+                                apps.addApplication(appInstanceTillNow);
+                            }
+                            for (InstanceInfo instanceInfo : application.getInstances()) {
+                                appInstanceTillNow.addInstance(instanceInfo);
+                            }
                         } else {
-                            incorrectPositions.add(new BetterBlockPos(blockX, blockY, blockZ));
-                            observedCompleted.remove(BetterBlockPos.longHash(blockX, blockY, blockZ));
-                            if (incorrectPositions.size() > Baritone.settings().incorrectSize.value) {
-                                return;
+                            logger.debug("Application {} not fetched from the remote region {} as there exists a "
+                                            + "whitelist and this app is not in the whitelist.",
+                                    application.getName(), remoteRegion);
+                        }
+                    }
+                } else {
+                    logger.warn("No remote registry available for the remote region {}", remoteRegion);
+                }
+            }
+        }
+        apps.setAppsHashCode(apps.getReconcileHashCode());
+        return apps;
+    }
+
+    private boolean shouldFetchFromRemoteRegistry(String appName, String remoteRegion) {
+        Set<String> whiteList = serverConfig.getRemoteRegionAppWhitelist(remoteRegion);
+        if (null == whiteList) {
+            whiteList = serverConfig.getRemoteRegionAppWhitelist(null); // see global whitelist.
+        }
+        return null == whiteList || whiteList.contains(appName);
+    }
+
+    /**
+     * Get the registry information about all {@link Applications}.
+     *
+     * @param includeRemoteRegion true, if we need to include applications from remote regions
+     *                            as indicated by the region {@link URL} by this property
+     *                            {@link EurekaServerConfig#getRemoteRegionUrls()}, false otherwise
+     * @return applications
+     *
+     * @deprecated Use {@link #getApplicationsFromMultipleRegions(String[])} instead. This method has a flawed behavior
+     * of transparently falling back to a remote region if no instances for an app is available locally. The new
+     * behavior is to explicitly specify if you need a remote region.
+     */
+    @Deprecated
+    public Applications getApplications(boolean includeRemoteRegion) {
+        GET_ALL_CACHE_MISS.increment();
+        Applications apps = new Applications();
+        apps.setVersion(1L);
+        for (Entry<String, Map<String, Lease<InstanceInfo>>> entry : registry.entrySet()) {
+            Application app = null;
+
+            if (entry.getValue() != null) {
+                for (Entry<String, Lease<InstanceInfo>> stringLeaseEntry : entry.getValue().entrySet()) {
+
+                    Lease<InstanceInfo> lease = stringLeaseEntry.getValue();
+
+                    if (app == null) {
+                        app = new Application(lease.getHolder().getAppName());
+                    }
+
+                    app.addInstance(decorateInstanceInfo(lease));
+                }
+            }
+            if (app != null) {
+                apps.addApplication(app);
+            }
+        }
+        if (includeRemoteRegion) {
+            for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                Applications applications = remoteRegistry.getApplications();
+                for (Application application : applications
+                        .getRegisteredApplications()) {
+                    Application appInLocalRegistry = apps
+                            .getRegisteredApplications(application.getName());
+                    if (appInLocalRegistry == null) {
+                        apps.addApplication(application);
+                    }
+                }
+            }
+        }
+        apps.setAppsHashCode(apps.getReconcileHashCode());
+        return apps;
+    }
+
+    /**
+     * Get the registry information about the delta changes. The deltas are
+     * cached for a window specified by
+     * {@link EurekaServerConfig#getRetentionTimeInMSInDeltaQueue()}. Subsequent
+     * requests for delta information may return the same information and client
+     * must make sure this does not adversely affect them.
+     *
+     * @return all application deltas.
+     * @deprecated use {@link #getApplicationDeltasFromMultipleRegions(String[])} instead. This method has a
+     * flawed behavior of transparently falling back to a remote region if no instances for an app is available locally.
+     * The new behavior is to explicitly specify if you need a remote region.
+     */
+    @Deprecated
+    public Applications getApplicationDeltas() {
+        GET_ALL_CACHE_MISS_DELTA.increment();
+        Applications apps = new Applications();
+        apps.setVersion(responseCache.getVersionDelta().get());
+        Map<String, Application> applicationInstancesMap = new HashMap<String, Application>();
+        write.lock();
+        try {
+            Iterator<RecentlyChangedItem> iter = this.recentlyChangedQueue.iterator();
+            logger.debug("The number of elements in the delta queue is : {}",
+                    this.recentlyChangedQueue.size());
+            while (iter.hasNext()) {
+                Lease<InstanceInfo> lease = iter.next().getLeaseInfo();
+                InstanceInfo instanceInfo = lease.getHolder();
+                logger.debug(
+                        "The instance id {} is found with status {} and actiontype {}",
+                        instanceInfo.getId(), instanceInfo.getStatus().name(), instanceInfo.getActionType().name());
+                Application app = applicationInstancesMap.get(instanceInfo
+                        .getAppName());
+                if (app == null) {
+                    app = new Application(instanceInfo.getAppName());
+                    applicationInstancesMap.put(instanceInfo.getAppName(), app);
+                    apps.addApplication(app);
+                }
+                app.addInstance(new InstanceInfo(decorateInstanceInfo(lease)));
+            }
+
+            boolean disableTransparentFallback = serverConfig.disableTransparentFallbackToOtherRegion();
+
+            if (!disableTransparentFallback) {
+                Applications allAppsInLocalRegion = getApplications(false);
+
+                for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                    Applications applications = remoteRegistry.getApplicationDeltas();
+                    for (Application application : applications.getRegisteredApplications()) {
+                        Application appInLocalRegistry =
+                                allAppsInLocalRegion.getRegisteredApplications(application.getName());
+                        if (appInLocalRegistry == null) {
+                            apps.addApplication(application);
+                        }
+                    }
+                }
+            }
+
+            Applications allApps = getApplications(!disableTransparentFallback);
+            apps.setAppsHashCode(allApps.getReconcileHashCode());
+            return apps;
+        } finally {
+            write.unlock();
+        }
+    }
+
+    /**
+     * Gets the application delta also including instances from the passed remote regions, with the instances from the
+     * local region. <br/>
+     *
+     * The remote regions from where the instances will be chosen can further be restricted if this application does not
+     * appear in the whitelist specified for the region as returned by
+     * {@link EurekaServerConfig#getRemoteRegionAppWhitelist(String)} for a region. In case, there is no whitelist
+     * defined for a region, this method will also look for a global whitelist by passing <code>null</code> to the
+     * method {@link EurekaServerConfig#getRemoteRegionAppWhitelist(String)} <br/>
+     *
+     * @param remoteRegions The remote regions for which the instances are to be queried. The instances may be limited
+     *                      by a whitelist as explained above. If <code>null</code> all remote regions are included.
+     *                      If empty list then no remote region is included.
+     *
+     * @return The delta with instances from the passed remote regions as well as local region. The instances
+     * from remote regions can be further be restricted as explained above. <code>null</code> if the application does
+     * not exist locally or in remote regions.
+     */
+    public Applications getApplicationDeltasFromMultipleRegions(String[] remoteRegions) {
+        if (null == remoteRegions) {
+            remoteRegions = allKnownRemoteRegions; // null means all remote regions.
+        }
+
+        boolean includeRemoteRegion = remoteRegions.length != 0;
+
+        if (includeRemoteRegion) {
+            GET_ALL_WITH_REMOTE_REGIONS_CACHE_MISS_DELTA.increment();
+        } else {
+            GET_ALL_CACHE_MISS_DELTA.increment();
+        }
+
+        Applications apps = new Applications();
+        apps.setVersion(responseCache.getVersionDeltaWithRegions().get());
+        Map<String, Application> applicationInstancesMap = new HashMap<String, Application>();
+        write.lock();
+        try {
+            Iterator<RecentlyChangedItem> iter = this.recentlyChangedQueue.iterator();
+            logger.debug("The number of elements in the delta queue is :{}", this.recentlyChangedQueue.size());
+            while (iter.hasNext()) {
+                Lease<InstanceInfo> lease = iter.next().getLeaseInfo();
+                InstanceInfo instanceInfo = lease.getHolder();
+                logger.debug("The instance id {} is found with status {} and actiontype {}",
+                        instanceInfo.getId(), instanceInfo.getStatus().name(), instanceInfo.getActionType().name());
+                Application app = applicationInstancesMap.get(instanceInfo.getAppName());
+                if (app == null) {
+                    app = new Application(instanceInfo.getAppName());
+                    applicationInstancesMap.put(instanceInfo.getAppName(), app);
+                    apps.addApplication(app);
+                }
+                app.addInstance(new InstanceInfo(decorateInstanceInfo(lease)));
+            }
+
+            if (includeRemoteRegion) {
+                for (String remoteRegion : remoteRegions) {
+                    RemoteRegionRegistry remoteRegistry = regionNameVSRemoteRegistry.get(remoteRegion);
+                    if (null != remoteRegistry) {
+                        Applications remoteAppsDelta = remoteRegistry.getApplicationDeltas();
+                        if (null != remoteAppsDelta) {
+                            for (Application application : remoteAppsDelta.getRegisteredApplications()) {
+                                if (shouldFetchFromRemoteRegistry(application.getName(), remoteRegion)) {
+                                    Application appInstanceTillNow =
+                                            apps.getRegisteredApplications(application.getName());
+                                    if (appInstanceTillNow == null) {
+                                        appInstanceTillNow = new Application(application.getName());
+                                        apps.addApplication(appInstanceTillNow);
+                                    }
+                                    for (InstanceInfo instanceInfo : application.getInstances()) {
+                                        appInstanceTillNow.addInstance(new InstanceInfo(instanceInfo));
+                                    }
+                                }
                             }
                         }
-                        continue;
                     }
-                    // this is not in render distance
-                    if (!observedCompleted.contains(BetterBlockPos.longHash(blockX, blockY, blockZ))) {
-                        // and we've never seen this position be correct
-                        // therefore mark as incorrect
-                        incorrectPositions.add(new BetterBlockPos(blockX, blockY, blockZ));
-                        if (incorrectPositions.size() > Baritone.settings().incorrectSize.value) {
-                            return;
-                        }
+                }
+            }
+
+            Applications allApps = getApplicationsFromMultipleRegions(remoteRegions);
+            apps.setAppsHashCode(allApps.getReconcileHashCode());
+            return apps;
+        } finally {
+            write.unlock();
+        }
+    }
+
+    /**
+     * Gets the {@link InstanceInfo} information.
+     *
+     * @param appName the application name for which the information is requested.
+     * @param id the unique identifier of the instance.
+     * @return the information about the instance.
+     */
+    @Override
+    public InstanceInfo getInstanceByAppAndId(String appName, String id) {
+        return this.getInstanceByAppAndId(appName, id, true);
+    }
+
+    /**
+     * Gets the {@link InstanceInfo} information.
+     *
+     * @param appName the application name for which the information is requested.
+     * @param id the unique identifier of the instance.
+     * @param includeRemoteRegions true, if we need to include applications from remote regions
+     *                             as indicated by the region {@link URL} by this property
+     *                             {@link EurekaServerConfig#getRemoteRegionUrls()}, false otherwise
+     * @return the information about the instance.
+     */
+    @Override
+    public InstanceInfo getInstanceByAppAndId(String appName, String id, boolean includeRemoteRegions) {
+        Map<String, Lease<InstanceInfo>> leaseMap = registry.get(appName);
+        Lease<InstanceInfo> lease = null;
+        if (leaseMap != null) {
+            lease = leaseMap.get(id);
+        }
+        if (lease != null
+                && (!isLeaseExpirationEnabled() || !lease.isExpired())) {
+            return decorateInstanceInfo(lease);
+        } else if (includeRemoteRegions) {
+            for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                Application application = remoteRegistry.getApplication(appName);
+                if (application != null) {
+                    return application.getByInstanceId(id);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @deprecated Try {@link #getInstanceByAppAndId(String, String)} instead.
+     *
+     * Get all instances by ID, including automatically asking other regions if the ID is unknown.
+     *
+     * @see com.netflix.discovery.shared.LookupService#getInstancesById(String)
+     */
+    @Deprecated
+    public List<InstanceInfo> getInstancesById(String id) {
+        return this.getInstancesById(id, true);
+    }
+
+    /**
+     * @deprecated Try {@link #getInstanceByAppAndId(String, String, boolean)} instead.
+     *
+     * Get the list of instances by its unique id.
+     *
+     * @param id the unique id of the instance
+     * @param includeRemoteRegions true, if we need to include applications from remote regions
+     *                             as indicated by the region {@link URL} by this property
+     *                             {@link EurekaServerConfig#getRemoteRegionUrls()}, false otherwise
+     * @return list of InstanceInfo objects.
+     */
+    @Deprecated
+    public List<InstanceInfo> getInstancesById(String id, boolean includeRemoteRegions) {
+        List<InstanceInfo> list = new ArrayList<InstanceInfo>();
+
+        for (Iterator<Entry<String, Map<String, Lease<InstanceInfo>>>> iter =
+                     registry.entrySet().iterator(); iter.hasNext(); ) {
+
+            Map<String, Lease<InstanceInfo>> leaseMap = iter.next().getValue();
+            if (leaseMap != null) {
+                Lease<InstanceInfo> lease = leaseMap.get(id);
+
+                if (lease == null || (isLeaseExpirationEnabled() && lease.isExpired())) {
+                    continue;
+                }
+
+                if (list == Collections.EMPTY_LIST) {
+                    list = new ArrayList<InstanceInfo>();
+                }
+                list.add(decorateInstanceInfo(lease));
+            }
+        }
+        if (list.isEmpty() && includeRemoteRegions) {
+            for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                for (Application application : remoteRegistry.getApplications()
+                        .getRegisteredApplications()) {
+                    InstanceInfo instanceInfo = application.getByInstanceId(id);
+                    if (instanceInfo != null) {
+                        list.add(instanceInfo);
+                        return list;
                     }
                 }
             }
         }
+        return list;
     }
 
-    private Goal assemble(BuilderCalculationContext bcc, List<IBlockState> approxPlaceable) {
-        return assemble(bcc, approxPlaceable, false);
+    private InstanceInfo decorateInstanceInfo(Lease<InstanceInfo> lease) {
+        InstanceInfo info = lease.getHolder();
+
+        // client app settings
+        int renewalInterval = LeaseInfo.DEFAULT_LEASE_RENEWAL_INTERVAL;
+        int leaseDuration = LeaseInfo.DEFAULT_LEASE_DURATION;
+
+        // TODO: clean this up
+        if (info.getLeaseInfo() != null) {
+            renewalInterval = info.getLeaseInfo().getRenewalIntervalInSecs();
+            leaseDuration = info.getLeaseInfo().getDurationInSecs();
+        }
+
+        info.setLeaseInfo(LeaseInfo.Builder.newBuilder()
+                .setRegistrationTimestamp(lease.getRegistrationTimestamp())
+                .setRenewalTimestamp(lease.getLastRenewalTimestamp())
+                .setServiceUpTimestamp(lease.getServiceUpTimestamp())
+                .setRenewalIntervalInSecs(renewalInterval)
+                .setDurationInSecs(leaseDuration)
+                .setEvictionTimestamp(lease.getEvictionTimestamp()).build());
+
+        info.setIsCoordinatingDiscoveryServer();
+        return info;
     }
 
-    private Goal assemble(BuilderCalculationContext bcc, List<IBlockState> approxPlaceable, boolean logMissing) {
-        List<BetterBlockPos> placeable = new ArrayList<>();
-        List<BetterBlockPos> breakable = new ArrayList<>();
-        List<BetterBlockPos> sourceLiquids = new ArrayList<>();
-        List<BetterBlockPos> flowingLiquids = new ArrayList<>();
-        Map<IBlockState, Integer> missing = new HashMap<>();
-        incorrectPositions.forEach(pos -> {
-            IBlockState state = bcc.bsi.get0(pos);
-            if (state.getBlock() instanceof BlockAir) {
-                if (approxPlaceable.contains(bcc.getSchematic(pos.x, pos.y, pos.z, state))) {
-                    placeable.add(pos);
-                } else {
-                    IBlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, state);
-                    missing.put(desired, 1 + missing.getOrDefault(desired, 0));
-                }
-            } else {
-                if (state.getBlock() instanceof BlockLiquid) {
-                    // if the block itself is JUST a liquid (i.e. not just a waterlogged block), we CANNOT break it
-                    // TODO for 1.13 make sure that this only matches pure water, not waterlogged blocks
-                    if (!MovementHelper.possiblyFlowing(state)) {
-                        // if it's a source block then we want to replace it with a throwaway
-                        sourceLiquids.add(pos);
+    /**
+     * Servo route; do not call.
+     *
+     * @return servo data
+     */
+    @com.netflix.servo.annotations.Monitor(name = "numOfRenewsInLastMin",
+            description = "Number of total heartbeats received in the last minute", type = DataSourceType.GAUGE)
+    @Override
+    public long getNumOfRenewsInLastMin() {
+        return renewsLastMin.getCount();
+    }
+
+
+    /**
+     * Gets the threshold for the renewals per minute.
+     *
+     * @return the integer representing the threshold for the renewals per
+     *         minute.
+     */
+    @com.netflix.servo.annotations.Monitor(name = "numOfRenewsPerMinThreshold", type = DataSourceType.GAUGE)
+    @Override
+    public int getNumOfRenewsPerMinThreshold() {
+        return numberOfRenewsPerMinThreshold;
+    }
+
+    /**
+     * Get the N instances that are most recently registered.
+     *
+     * @return
+     */
+    @Override
+    public List<Pair<Long, String>> getLastNRegisteredInstances() {
+        List<Pair<Long, String>> list = new ArrayList<Pair<Long, String>>(recentRegisteredQueue);
+        Collections.reverse(list);
+        return list;
+    }
+
+    /**
+     * Get the N instances that have most recently canceled.
+     *
+     * @return
+     */
+    @Override
+    public List<Pair<Long, String>> getLastNCanceledInstances() {
+        List<Pair<Long, String>> list = new ArrayList<Pair<Long, String>>(recentCanceledQueue);
+        Collections.reverse(list);
+        return list;
+    }
+
+    private void invalidateCache(String appName, @Nullable String vipAddress, @Nullable String secureVipAddress) {
+        // invalidate cache
+        responseCache.invalidate(appName, vipAddress, secureVipAddress);
+    }
+
+    protected void updateRenewsPerMinThreshold() {
+        this.numberOfRenewsPerMinThreshold = (int) (this.expectedNumberOfClientsSendingRenews
+                * (60.0 / serverConfig.getExpectedClientRenewalIntervalSeconds())
+                * serverConfig.getRenewalPercentThreshold());
+    }
+
+    private static final class RecentlyChangedItem {
+        private long lastUpdateTime;
+        private Lease<InstanceInfo> leaseInfo;
+
+        public RecentlyChangedItem(Lease<InstanceInfo> lease) {
+            this.leaseInfo = lease;
+            lastUpdateTime = System.currentTimeMillis();
+        }
+
+        public long getLastUpdateTime() {
+            return this.lastUpdateTime;
+        }
+
+        public Lease<InstanceInfo> getLeaseInfo() {
+            return this.leaseInfo;
+        }
+    }
+
+    protected void postInit() {
+        renewsLastMin.start();
+        if (evictionTaskRef.get() != null) {
+            evictionTaskRef.get().cancel();
+        }
+        evictionTaskRef.set(new EvictionTask());
+        evictionTimer.schedule(evictionTaskRef.get(),
+                serverConfig.getEvictionIntervalTimerInMs(),
+                serverConfig.getEvictionIntervalTimerInMs());
+    }
+
+    /**
+     * Perform all cleanup and shutdown operations.
+     */
+    @Override
+    public void shutdown() {
+        deltaRetentionTimer.cancel();
+        evictionTimer.cancel();
+        renewsLastMin.stop();
+        responseCache.stop();
+    }
+
+    @com.netflix.servo.annotations.Monitor(name = "numOfElementsinInstanceCache", description = "Number of overrides in the instance Cache", type = DataSourceType.GAUGE)
+    public long getNumberofElementsininstanceCache() {
+        return overriddenInstanceStatusMap.size();
+    }
+
+    /* visible for testing */ class EvictionTask extends TimerTask {
+
+        private final AtomicLong lastExecutionNanosRef = new AtomicLong(0l);
+
+        @Override
+        public void run() {
+            try {
+                long compensationTimeMs = getCompensationTimeMs();
+                logger.info("Running the evict task with compensationTime {}ms", compensationTimeMs);
+                evict(compensationTimeMs);
+            } catch (Throwable e) {
+                logger.error("Could not run the evict task", e);
+            }
+        }
+
+        /**
+         * compute a compensation time defined as the actual time this task was executed since the prev iteration,
+         * vs the configured amount of time for execution. This is useful for cases where changes in time (due to
+         * clock skew or gc for example) causes the actual eviction task to execute later than the desired time
+         * according to the configured cycle.
+         */
+        long getCompensationTimeMs() {
+            long currNanos = getCurrentTimeNano();
+            long lastNanos = lastExecutionNanosRef.getAndSet(currNanos);
+            if (lastNanos == 0l) {
+                return 0l;
+            }
+
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(currNanos - lastNanos);
+            long compensationTime = elapsedMs - serverConfig.getEvictionIntervalTimerInMs();
+            return compensationTime <= 0l ? 0l : compensationTime;
+        }
+
+        long getCurrentTimeNano() {  // for testing
+            return System.nanoTime();
+        }
+
+    }
+
+    /* visible for testing */ static class CircularQueue<E> extends AbstractQueue<E> {
+
+        private final ArrayBlockingQueue<E> delegate;
+        private final int capacity;
+
+        public CircularQueue(int capacity) {
+            this.capacity = capacity;
+            this.delegate = new ArrayBlockingQueue<>(capacity);
+        }
+
+        @Override
+        public Iterator<E> iterator() {
+            return delegate.iterator();
+        }
+
+        @Override
+        public int size() {
+            return delegate.size();
+        }
+
+        @Override
+        public boolean offer(E e) {
+            while (!delegate.offer(e)) {
+                delegate.poll();
+            }
+            return true;
+        }
+
+        @Override
+        public E poll() {
+            return delegate.poll();
+        }
+
+        @Override
+        public E peek() {
+            return delegate.peek();
+        }
+
+        @Override
+        public void clear() {
+            delegate.clear();
+        }
+
+        @Override
+        public Object[] toArray() {
+            return delegate.toArray();
+        }
+    }
+
+    /**
+     * @return The rule that will process the instance status override.
+     */
+    protected abstract InstanceStatusOverrideRule getInstanceInfoOverrideRule();
+
+    protected InstanceInfo.InstanceStatus getOverriddenInstanceStatus(InstanceInfo r,
+                                                                    Lease<InstanceInfo> existingLease,
+                                                                    boolean isReplication) {
+        InstanceStatusOverrideRule rule = getInstanceInfoOverrideRule();
+        logger.debug("Processing override status using rule: {}", rule);
+        return rule.apply(r, existingLease, isReplication).status();
+    }
+
+    private TimerTask getDeltaRetentionTask() {
+        return new TimerTask() {
+
+            @Override
+            public void run() {
+                Iterator<RecentlyChangedItem> it = recentlyChangedQueue.iterator();
+                while (it.hasNext()) {
+                    if (it.next().getLastUpdateTime() <
+                            System.currentTimeMillis() - serverConfig.getRetentionTimeInMSInDeltaQueue()) {
+                        it.remove();
                     } else {
-                        flowingLiquids.add(pos);
+                        break;
                     }
-                } else {
-                    breakable.add(pos);
                 }
             }
-        });
-        List<Goal> toBreak = new ArrayList<>();
-        breakable.forEach(pos -> toBreak.add(breakGoal(pos, bcc)));
-        List<Goal> toPlace = new ArrayList<>();
-        placeable.forEach(pos -> {
-            if (!placeable.contains(pos.down()) && !placeable.contains(pos.down(2))) {
-                toPlace.add(placementGoal(pos, bcc));
-            }
-        });
-        sourceLiquids.forEach(pos -> toPlace.add(new GoalBlock(pos.up())));
 
-        if (!toPlace.isEmpty()) {
-            return new JankyGoalComposite(new GoalComposite(toPlace.toArray(new Goal[0])), new GoalComposite(toBreak.toArray(new Goal[0])));
-        }
-        if (toBreak.isEmpty()) {
-            if (logMissing && !missing.isEmpty()) {
-                logDirect("Missing materials for at least:");
-                logDirect(missing.entrySet().stream()
-                        .map(e -> String.format("%sx %s", e.getValue(), e.getKey()))
-                        .collect(Collectors.joining("\n")));
-            }
-            if (logMissing && !flowingLiquids.isEmpty()) {
-                logDirect("Unreplaceable liquids at at least:");
-                logDirect(flowingLiquids.stream()
-                        .map(p -> String.format("%s %s %s", p.x, p.y, p.z))
-                        .collect(Collectors.joining("\n")));
-            }
-            return null;
-        }
-        return new GoalComposite(toBreak.toArray(new Goal[0]));
-    }
-
-    public static class JankyGoalComposite implements Goal {
-
-        private final Goal primary;
-        private final Goal fallback;
-
-        public JankyGoalComposite(Goal primary, Goal fallback) {
-            this.primary = primary;
-            this.fallback = fallback;
-        }
-
-
-        @Override
-        public boolean isInGoal(int x, int y, int z) {
-            return primary.isInGoal(x, y, z) || fallback.isInGoal(x, y, z);
-        }
-
-        @Override
-        public double heuristic(int x, int y, int z) {
-            return primary.heuristic(x, y, z);
-        }
-
-        @Override
-        public String toString() {
-            return "JankyComposite Primary: " + primary + " Fallback: " + fallback;
-        }
-    }
-
-    public static class GoalBreak extends GoalGetToBlock {
-
-        public GoalBreak(BlockPos pos) {
-            super(pos);
-        }
-
-        @Override
-        public boolean isInGoal(int x, int y, int z) {
-            // can't stand right on top of a block, that might not work (what if it's unsupported, can't break then)
-            if (y > this.y) {
-                return false;
-            }
-            // but any other adjacent works for breaking, including inside or below
-            return super.isInGoal(x, y, z);
-        }
-    }
-
-    private Goal placementGoal(BlockPos pos, BuilderCalculationContext bcc) {
-        if (ctx.world().getBlockState(pos).getBlock() != Blocks.AIR) { // TODO can this even happen?
-            return new GoalPlace(pos);
-        }
-        boolean allowSameLevel = ctx.world().getBlockState(pos.up()).getBlock() != Blocks.AIR;
-        IBlockState current = ctx.world().getBlockState(pos);
-        for (EnumFacing facing : Movement.HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP) {
-            //noinspection ConstantConditions
-            if (MovementHelper.canPlaceAgainst(ctx, pos.offset(facing)) && ctx.world().mayPlace(bcc.getSchematic(pos.getX(), pos.getY(), pos.getZ(), current).getBlock(), pos, false, facing, null)) {
-                return new GoalAdjacent(pos, pos.offset(facing), allowSameLevel);
-            }
-        }
-        return new GoalPlace(pos);
-    }
-
-    private Goal breakGoal(BlockPos pos, BuilderCalculationContext bcc) {
-        if (Baritone.settings().goalBreakFromAbove.value && bcc.bsi.get0(pos.up()).getBlock() instanceof BlockAir && bcc.bsi.get0(pos.up(2)).getBlock() instanceof BlockAir) { // TODO maybe possible without the up(2) check?
-            return new JankyGoalComposite(new GoalBreak(pos), new GoalGetToBlock(pos.up()) {
-                @Override
-                public boolean isInGoal(int x, int y, int z) {
-                    if (y > this.y || (x == this.x && y == this.y && z == this.z)) {
-                        return false;
-                    }
-                    return super.isInGoal(x, y, z);
-                }
-            });
-        }
-        return new GoalBreak(pos);
-    }
-
-    public static class GoalAdjacent extends GoalGetToBlock {
-
-        private boolean allowSameLevel;
-        private BlockPos no;
-
-        public GoalAdjacent(BlockPos pos, BlockPos no, boolean allowSameLevel) {
-            super(pos);
-            this.no = no;
-            this.allowSameLevel = allowSameLevel;
-        }
-
-        public boolean isInGoal(int x, int y, int z) {
-            if (x == this.x && y == this.y && z == this.z) {
-                return false;
-            }
-            if (x == no.getX() && y == no.getY() && z == no.getZ()) {
-                return false;
-            }
-            if (!allowSameLevel && y == this.y - 1) {
-                return false;
-            }
-            if (y < this.y - 1) {
-                return false;
-            }
-            return super.isInGoal(x, y, z);
-        }
-
-        public double heuristic(int x, int y, int z) {
-            // prioritize lower y coordinates
-            return this.y * 100 + super.heuristic(x, y, z);
-        }
-    }
-
-    public static class GoalPlace extends GoalBlock {
-
-        public GoalPlace(BlockPos placeAt) {
-            super(placeAt.up());
-        }
-
-        public double heuristic(int x, int y, int z) {
-            // prioritize lower y coordinates
-            return this.y * 100 + super.heuristic(x, y, z);
-        }
-    }
-
-    @Override
-    public void onLostControl() {
-        incorrectPositions = null;
-        name = null;
-        schematic = null;
-        realSchematic = null;
-        layer = Baritone.settings().startAtLayer.value;
-        numRepeats = 0;
-        paused = false;
-        observedCompleted = null;
-    }
-
-    @Override
-    public String displayName0() {
-        return paused ? "Builder Paused" : "Building " + name;
-    }
-
-    private List<IBlockState> approxPlaceable(int size) {
-        List<IBlockState> result = new ArrayList<>();
-        for (int i = 0; i < size; i++) {
-            ItemStack stack = ctx.player().inventory.mainInventory.get(i);
-            if (stack.isEmpty() || !(stack.getItem() instanceof ItemBlock)) {
-                result.add(Blocks.AIR.getDefaultState());
-                continue;
-            }
-            // <toxic cloud>
-            result.add(((ItemBlock) stack.getItem()).getBlock().getStateForPlacement(ctx.world(), ctx.playerFeet(), EnumFacing.UP, (float) ctx.player().posX, (float) ctx.player().posY, (float) ctx.player().posZ, stack.getItem().getMetadata(stack.getMetadata()), ctx.player()));
-            // </toxic cloud>
-        }
-        return result;
-    }
-
-    private boolean valid(IBlockState current, IBlockState desired, boolean itemVerify) {
-        if (desired == null) {
-            return true;
-        }
-        if (current.getBlock() instanceof BlockLiquid && Baritone.settings().okIfWater.value) {
-            return true;
-        }
-        if (current.getBlock() instanceof BlockAir && Baritone.settings().okIfAir.value.contains(desired.getBlock())) {
-            return true;
-        }
-        if (desired.getBlock() instanceof BlockAir && Baritone.settings().buildIgnoreBlocks.value.contains(current.getBlock())) {
-            return true;
-        }
-        if (!(current.getBlock() instanceof BlockAir) && Baritone.settings().buildIgnoreExisting.value && !itemVerify) {
-            return true;
-        }
-        return current.equals(desired);
-    }
-
-    public class BuilderCalculationContext extends CalculationContext {
-
-        private final List<IBlockState> placeable;
-        private final ISchematic schematic;
-        private final int originX;
-        private final int originY;
-        private final int originZ;
-
-        public BuilderCalculationContext() {
-            super(BuilderProcess.this.baritone, true); // wew lad
-            this.placeable = approxPlaceable(9);
-            this.schematic = BuilderProcess.this.schematic;
-            this.originX = origin.getX();
-            this.originY = origin.getY();
-            this.originZ = origin.getZ();
-
-            this.jumpPenalty += 10;
-            this.backtrackCostFavoringCoefficient = 1;
-        }
-
-        private IBlockState getSchematic(int x, int y, int z, IBlockState current) {
-            if (schematic.inSchematic(x - originX, y - originY, z - originZ, current)) {
-                return schematic.desiredState(x - originX, y - originY, z - originZ, current, BuilderProcess.this.approxPlaceable);
-            } else {
-                return null;
-            }
-        }
-
-        @Override
-        public double costOfPlacingAt(int x, int y, int z, IBlockState current) {
-            if (isPossiblyProtected(x, y, z) || !worldBorder.canPlaceAt(x, z)) { // make calculation fail properly if we can't build
-                return COST_INF;
-            }
-            IBlockState sch = getSchematic(x, y, z, current);
-            if (sch != null) {
-                // TODO this can return true even when allowPlace is off.... is that an issue?
-                if (sch.getBlock() == Blocks.AIR) {
-                    // we want this to be air, but they're asking if they can place here
-                    // this won't be a schematic block, this will be a throwaway
-                    return placeBlockCost * 2; // we're going to have to break it eventually
-                }
-                if (placeable.contains(sch)) {
-                    return 0; // thats right we gonna make it FREE to place a block where it should go in a structure
-                    // no place block penalty at all 😎
-                    // i'm such an idiot that i just tried to copy and paste the epic gamer moment emoji too
-                    // get added to unicode when?
-                }
-                if (!hasThrowaway) {
-                    return COST_INF;
-                }
-                // we want it to be something that we don't have
-                // even more of a pain to place something wrong
-                return placeBlockCost * 3;
-            } else {
-                if (hasThrowaway) {
-                    return placeBlockCost;
-                } else {
-                    return COST_INF;
-                }
-            }
-        }
-
-        @Override
-        public double breakCostMultiplierAt(int x, int y, int z, IBlockState current) {
-            if (!allowBreak || isPossiblyProtected(x, y, z)) {
-                return COST_INF;
-            }
-            IBlockState sch = getSchematic(x, y, z, current);
-            if (sch != null) {
-                if (sch.getBlock() == Blocks.AIR) {
-                    // it should be air
-                    // regardless of current contents, we can break it
-                    return 1;
-                }
-                // it should be a real block
-                // is it already that block?
-                if (valid(bsi.get0(x, y, z), sch, false)) {
-                    return Baritone.settings().breakCorrectBlockPenaltyMultiplier.value;
-                } else {
-                    // can break if it's wrong
-                    // would be great to return less than 1 here, but that would actually make the cost calculation messed up
-                    // since we're breaking a block, if we underestimate the cost, then it'll fail when it really takes the correct amount of time
-                    return 1;
-
-                }
-                // TODO do blocks in render distace only?
-                // TODO allow breaking blocks that we have a tool to harvest and immediately place back?
-            } else {
-                return 1; // why not lol
-            }
-        }
+        };
     }
 }
