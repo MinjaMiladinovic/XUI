@@ -14,629 +14,596 @@
  * limitations under the License.
  */
 
-package com.xuexiang.xui.widget.tabbar;
+package com.xuexiang.xui.utils;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
-import android.content.res.Configuration;
-import android.content.res.TypedArray;
+import android.content.res.Resources;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.Typeface;
+import android.graphics.ColorFilter;
+import android.graphics.LightingColorFilter;
+import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
+import android.graphics.drawable.ShapeDrawable;
 import android.graphics.drawable.StateListDrawable;
-import android.os.Build;
-import android.util.AttributeSet;
-import android.util.TypedValue;
-import android.view.Gravity;
 import android.view.View;
-import android.view.ViewGroup;
-import android.widget.CheckBox;
-import android.widget.CompoundButton;
-import android.widget.LinearLayout;
+import android.webkit.WebView;
+import android.widget.ImageView;
+import android.widget.ScrollView;
 
+import androidx.annotation.ColorInt;
+import androidx.annotation.DrawableRes;
+import androidx.annotation.FloatRange;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.appcompat.content.res.AppCompatResources;
+import androidx.core.widget.NestedScrollView;
 
-import com.xuexiang.xui.R;
-import com.xuexiang.xui.XUI;
-import com.xuexiang.xui.utils.ResUtils;
-import com.xuexiang.xui.utils.ThemeUtils;
-
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-
-import io.github.inflationx.calligraphy3.HasTypeface;
-
-import static android.os.Build.VERSION_CODES.JELLY_BEAN;
+import java.security.InvalidParameterException;
 
 /**
- * 多选Tab（CheckBox实现）
+ * Drawable工具类
  *
  * @author xuexiang
- * @since 2019/1/2 下午11:25
+ * @since 2019/1/3 下午3:47
  */
-public class MultiTabControlView extends LinearLayout implements HasTypeface {
+public final class DrawableUtils {
 
-    private Context mContext;
-
-    /**
-     * 点击监听
-     */
-    private OnMultiTabSelectionChangedListener mListener;
-
-    /**
-     * 字体大小
-     */
-    private int mTextSize;
-    /**
-     * 边框宽度
-     */
-    private int mStrokeWidth;
-    /**
-     * 选项间距
-     */
-    private int mItemPadding;
-    /**
-     * 选项水平间距
-     */
-    private int mItemPaddingHorizontal;
-    /**
-     * 选项垂直间距
-     */
-    private int mItemPaddingVertical;
-    /**
-     * 选中背景的颜色
-     */
-    private int mSelectedColor;
-    /**
-     * 未选中背景的颜色
-     */
-    private int mUnselectedColor;
-    /**
-     * 选中文字的颜色
-     */
-    private int mSelectedTextColor;
-    /**
-     * 未选中文字的颜色
-     */
-    private int mUnselectedTextColor;
-    /**
-     * 默认选中项的索引集合
-     */
-    private int[] mDefaultSelectionList;
-    /**
-     * 是否展开（填充满）
-     */
-    private boolean mStretch = false;
-    /**
-     * 是否等宽显示
-     */
-    private boolean mEqualWidth = false;
-    private ColorStateList mTextColorStateList;
-
-    private LinkedHashMap<String, String> mItemMap = new LinkedHashMap<>();
-    private List<CheckBox> mOptions;
-
-    /**
-     * 增加多选框监听
-     *
-     * @param cb
-     */
-    private void addOnCheckedChangeListener(CheckBox cb) {
-        if (cb != null) {
-            cb.setOnCheckedChangeListener(mCheckBoxListener);
-        }
+    private DrawableUtils() {
+        throw new UnsupportedOperationException("u can't instantiate me...");
     }
 
-    private CompoundButton.OnCheckedChangeListener mCheckBoxListener = new CompoundButton.OnCheckedChangeListener() {
-        @Override
-        public void onCheckedChanged(CompoundButton checkBox, boolean isChecked) {
-            if (mListener != null) {
-                String identifier = checkBox.getText().toString();
-                String value = mItemMap.get(identifier);
-                mListener.newSelection(identifier, value, checkBox.isChecked());
+    private static final String TAG = DrawableUtils.class.getSimpleName();
+
+    /**
+     * 节省每次创建时产生的开销，但要注意多线程操作synchronized
+     */
+    private static final Canvas CANVAS = new Canvas();
+
+    /**
+     * 从一个view创建Bitmap。
+     * 注意点：绘制之前要清掉 View 的焦点，因为焦点可能会改变一个 View 的 UI 状态。
+     * 来源：https://github.com/tyrantgit/ExplosionField
+     *
+     * @param view  传入一个 View，会获取这个 View 的内容创建 Bitmap。
+     * @param scale 缩放比例，对创建的 Bitmap 进行缩放，数值支持从 0 到 1。
+     */
+    public static Bitmap createBitmapFromView(View view, float scale) {
+        if (view instanceof ImageView) {
+            Drawable drawable = ((ImageView) view).getDrawable();
+            if (drawable != null && drawable instanceof BitmapDrawable) {
+                return ((BitmapDrawable) drawable).getBitmap();
             }
         }
-    };
+        view.clearFocus();
+        int viewHeight = 0;
+        if (view instanceof ScrollView) {
+            for (int i = 0; i < ((ScrollView) view).getChildCount(); i++) {
+                viewHeight += ((ScrollView) view).getChildAt(i).getHeight();
+            }
+        } else if (view instanceof NestedScrollView) {
+            for (int i = 0; i < ((NestedScrollView) view).getChildCount(); i++) {
+                viewHeight += ((NestedScrollView) view).getChildAt(i).getHeight();
+            }
+        } else {
+            viewHeight = view.getHeight();
+        }
 
-    public MultiTabControlView(Context context) {
-        super(context, null);
-        //Initialize
-        init(context);
-        // Setup the view
-        update();
+        Bitmap bitmap = createBitmapSafely((int) (view.getWidth() * scale),
+                (int) (viewHeight * scale), Bitmap.Config.ARGB_8888, 1);
+        if (bitmap != null) {
+            synchronized (CANVAS) {
+                Canvas canvas = CANVAS;
+                canvas.setBitmap(bitmap);
+                canvas.save();
+                // 防止 View 上面有些区域空白导致最终 Bitmap 上有些区域变黑
+                canvas.drawColor(Color.WHITE);
+                canvas.scale(scale, scale);
+                view.draw(canvas);
+                canvas.restore();
+                canvas.setBitmap(null);
+            }
+        }
+        return bitmap;
     }
 
-    public MultiTabControlView(Context context, AttributeSet attrs) throws Exception {
-        super(context, attrs);
-        //Initialize
-        init(context);
-        initAttrs(context, attrs);
-        //Setup the view
-        update();
+
+    public static Bitmap createBitmapFromWebView(WebView view) {
+        return createBitmapFromWebView(view, 1f);
     }
 
-    private void initAttrs(Context context, AttributeSet attrs) throws Exception {
-        TypedArray attributes = context.getTheme().obtainStyledAttributes(
-                attrs,
-                R.styleable.TabControlView,
-                0, 0);
+    public static Bitmap createBitmapFromWebView(WebView view, float scale) {
+        view.clearFocus();
+        int viewHeight = (int) (view.getContentHeight() * view.getScale());
+        Bitmap bitmap = createBitmapSafely((int) (view.getWidth() * scale), (int) (viewHeight * scale), Bitmap.Config.ARGB_8888, 1);
+
+        int unitHeight = view.getHeight();
+        int bottom = viewHeight;
+
+        if (bitmap != null) {
+            synchronized (CANVAS) {
+                Canvas canvas = CANVAS;
+                canvas.setBitmap(bitmap);
+                // 防止 View 上面有些区域空白导致最终 Bitmap 上有些区域变黑
+                canvas.drawColor(Color.WHITE);
+                canvas.scale(scale, scale);
+                while (bottom > 0) {
+                    if (bottom < unitHeight) {
+                        bottom = 0;
+                    } else {
+                        bottom -= unitHeight;
+                    }
+                    canvas.save();
+                    canvas.clipRect(0, bottom, canvas.getWidth(), bottom + unitHeight);
+                    view.scrollTo(0, bottom);
+                    view.draw(canvas);
+                    canvas.restore();
+                }
+                canvas.setBitmap(null);
+            }
+        }
+        return bitmap;
+    }
+
+
+    public static Bitmap createBitmapFromView(View view) {
+        return createBitmapFromView(view, 1f);
+    }
+
+    /**
+     * 从一个view创建Bitmap。把view的区域截掉leftCrop/topCrop/rightCrop/bottomCrop
+     */
+    public static Bitmap createBitmapFromView(View view, int leftCrop, int topCrop, int rightCrop, int bottomCrop) {
+        Bitmap originBitmap = DrawableUtils.createBitmapFromView(view);
+        if (originBitmap == null) {
+            return null;
+        }
+        Bitmap cutBitmap = createBitmapSafely(view.getWidth() - rightCrop - leftCrop, view.getHeight() - topCrop - bottomCrop, Bitmap.Config.ARGB_8888, 1);
+        if (cutBitmap == null) {
+            return null;
+        }
+        Canvas canvas = new Canvas(cutBitmap);
+        Rect src = new Rect(leftCrop, topCrop, view.getWidth() - rightCrop, view.getHeight() - bottomCrop);
+        Rect dest = new Rect(0, 0, view.getWidth() - rightCrop - leftCrop, view.getHeight() - topCrop - bottomCrop);
+        // 防止 View 上面有些区域空白导致最终 Bitmap 上有些区域变黑
+        canvas.drawColor(Color.WHITE);
+        canvas.drawBitmap(originBitmap, src, dest, null);
+        originBitmap.recycle();
+        return cutBitmap;
+    }
+
+    /**
+     * 安全的创建bitmap。
+     * 如果新建 Bitmap 时产生了 OOM，可以主动进行一次 GC - System.gc()，然后再次尝试创建。
+     *
+     * @param width      Bitmap 宽度。
+     * @param height     Bitmap 高度。
+     * @param config     传入一个 Bitmap.Config。
+     * @param retryCount 创建 Bitmap 时产生 OOM 后，主动重试的次数。
+     * @return 返回创建的 Bitmap。
+     */
+    public static Bitmap createBitmapSafely(int width, int height, Bitmap.Config config, int retryCount) {
+        //width and height must be > 0
+        if (width <= 0 || height <= 0) {
+            return null;
+        }
         try {
-            mTextSize = attributes.getDimensionPixelSize(R.styleable.TabControlView_tcv_textSize, ResUtils.getDimensionPixelSize(R.dimen.default_tcv_text_size));
-            mSelectedColor = attributes.getColor(R.styleable.TabControlView_tcv_selectedColor, ThemeUtils.resolveColor(context, R.attr.colorAccent));
-            mUnselectedColor = attributes.getColor(R.styleable.TabControlView_tcv_unselectedColor, Color.TRANSPARENT);
-            mSelectedTextColor = attributes.getColor(R.styleable.TabControlView_tcv_selectedTextColor, Color.WHITE);
-            mUnselectedTextColor = attributes.getColor(R.styleable.TabControlView_tcv_unselectedTextColor, ThemeUtils.resolveColor(context, R.attr.colorAccent));
-            mStrokeWidth = attributes.getDimensionPixelSize(R.styleable.TabControlView_tcv_strokeWidth, ResUtils.getDimensionPixelSize(R.dimen.default_tcv_stroke_width));
-            mItemPadding = attributes.getDimensionPixelSize(R.styleable.TabControlView_tcv_item_padding, -1);
-            mItemPaddingHorizontal = attributes.getDimensionPixelSize(R.styleable.TabControlView_tcv_item_padding_horizontal, -1);
-            mItemPaddingVertical = attributes.getDimensionPixelSize(R.styleable.TabControlView_tcv_item_padding_vertical, -1);
-
-            //Set text mSelectedColor state list
-            mTextColorStateList = new ColorStateList(new int[][]{
-                    {-android.R.attr.state_checked}, {android.R.attr.state_checked}},
-                    new int[]{mUnselectedTextColor, mSelectedTextColor}
-            );
-
-            int defaultSelection = attributes.getInt(R.styleable.TabControlView_tcv_defaultSelection, -1);
-            if (defaultSelection > -1) {
-                mDefaultSelectionList = new int[]{defaultSelection};
+            return Bitmap.createBitmap(width, height, config);
+        } catch (OutOfMemoryError e) {
+            e.printStackTrace();
+            if (retryCount > 0) {
+                System.gc();
+                return createBitmapSafely(width, height, config, retryCount - 1);
             }
-            mEqualWidth = attributes.getBoolean(R.styleable.TabControlView_tcv_equalWidth, mEqualWidth);
-            mStretch = attributes.getBoolean(R.styleable.TabControlView_tcv_stretch, mStretch);
-
-            CharSequence[] itemArray = attributes.getTextArray(R.styleable.TabControlView_tcv_items);
-            CharSequence[] valueArray = attributes.getTextArray(R.styleable.TabControlView_tcv_values);
-
-            //Item and value arrays need to be of the same length
-            setItems(itemArray, valueArray);
-        } finally {
-            attributes.recycle();
+            return null;
         }
     }
 
-    private void init(Context context) {
-        mContext = context;
-        //Needed for calling the updateSide "setbackground" method
-        //Provide a tad bit of padding for the view
-        setPadding(10, 10, 10, 10);
-    }
 
     /**
-     * 更新显示
-     */
-    private void update() {
-        //Remove all views...
-        removeAllViews();
-
-        //Ensure orientation is horizontal
-        setOrientation(LinearLayout.HORIZONTAL);
-
-        float textWidth = 0;
-        mOptions = new ArrayList<>();
-
-        Iterator<Map.Entry<String, String>> itemIterator = mItemMap.entrySet().iterator();
-        int i = 0;
-        while (itemIterator.hasNext()) {
-            Map.Entry<String, String> item = itemIterator.next();
-
-            CheckBox cb = new CheckBox(mContext);
-            cb.setTextColor(mTextColorStateList);
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT);
-            if (mStretch) {
-                params.weight = 1.0F;
-            }
-            if (i > 0) {
-                params.setMarginStart(-mStrokeWidth);
-            }
-            cb.setLayoutParams(params);
-
-            //Clear out button drawable (text only)
-            cb.setButtonDrawable(new StateListDrawable());
-
-            //Create state list for background
-            if (i == 0) {
-                //Left
-                if (isRtl()) {
-                    updateCheckBox(cb, R.drawable.tcv_right_option, R.drawable.tcv_right_option_selected);
-                } else {
-                    updateCheckBox(cb, R.drawable.tcv_left_option, R.drawable.tcv_left_option_selected);
-                }
-            } else if (i == (mItemMap.size() - 1)) {
-                //Right
-                if (isRtl()) {
-                    updateCheckBox(cb, R.drawable.tcv_left_option, R.drawable.tcv_left_option_selected);
-                } else {
-                    updateCheckBox(cb, R.drawable.tcv_right_option, R.drawable.tcv_right_option_selected);
-                }
-            } else {
-                //Middle
-                updateCheckBox(cb, R.drawable.tcv_middle_option, R.drawable.tcv_middle_option_selected);
-            }
-
-            cb.setLayoutParams(params);
-            if (mItemPadding != -1) {
-                cb.setPadding(mItemPadding, mItemPadding, mItemPadding, mItemPadding);
-            }
-            if (mItemPaddingHorizontal != -1 && mItemPaddingVertical != -1) {
-                cb.setPadding(mItemPaddingHorizontal, mItemPaddingVertical, mItemPaddingHorizontal, mItemPaddingVertical);
-            }
-            cb.setMinWidth(mStrokeWidth * 10);
-            cb.setGravity(Gravity.CENTER);
-            cb.setTextSize(TypedValue.COMPLEX_UNIT_PX, mTextSize);
-            cb.setTypeface(XUI.getDefaultTypeface());
-            cb.setText(item.getKey());
-            addOnCheckedChangeListener(cb);
-            textWidth = Math.max(cb.getPaint().measureText(item.getKey()), textWidth);
-            mOptions.add(cb);
-
-            i++;
-        }
-
-        //We do this to make all the segments the same width
-        for (CheckBox option : mOptions) {
-            if (mEqualWidth) {
-                option.setWidth((int) (textWidth + (mStrokeWidth * 20)));
-            }
-            addView(option);
-        }
-
-        if (mDefaultSelectionList != null && mDefaultSelectionList.length > 0) {
-            for (int selection : mDefaultSelectionList) {
-                setIsChecked(selection, true);
-            }
-        }
-    }
-
-    private boolean isRtl() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 &&
-                getResources().getConfiguration().getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
-    }
-
-    /**
-     * 更新updateCheckBox的显示
+     * 安全的创建bitmap。
+     * 如果新建 Bitmap 时产生了 OOM，可以主动进行一次 GC - System.gc()，然后再次尝试创建。
      *
-     * @param cb
-     * @param tcv_option_normal
-     * @param tcv_option_selected
+     * @param source     原图片
+     * @param x          源中第一个像素的x坐标
+     * @param y          源中第一个像素的y坐标
+     * @param width      一行像素点的数量
+     * @param height     行数
+     * @param retryCount 创建 Bitmap 时产生 OOM 后，主动重试的次数。
+     * @return 返回创建的 Bitmap。
      */
-    private void updateCheckBox(CheckBox cb, int tcv_option_normal, int tcv_option_selected) {
-        GradientDrawable unselected = (GradientDrawable) mContext.getResources().getDrawable(tcv_option_normal).mutate();
-        unselected.setStroke(mStrokeWidth, mSelectedColor);
-        unselected.setDither(true);
-        unselected.setColor(mUnselectedColor);
-        GradientDrawable selected = (GradientDrawable) mContext.getResources().getDrawable(tcv_option_selected).mutate();
-        selected.setColor(mSelectedColor);
-        selected.setStroke(mStrokeWidth, mSelectedColor);
-
-        setCheckBoxBackground(cb, unselected, selected);
+    public static Bitmap createBitmapSafely(@NonNull Bitmap source, int x, int y, int width, int height, int retryCount) {
+        if (x < 0 || y < 0 || width <= 0 || height <= 0) {
+            return null;
+        }
+        try {
+            return Bitmap.createBitmap(source, x, y, width, height);
+        } catch (IllegalArgumentException e) {
+            e.printStackTrace();
+            return null;
+        } catch (OutOfMemoryError e) {
+            e.printStackTrace();
+            if (retryCount > 0) {
+                System.gc();
+                return createBitmapSafely(source, x, y, width, height, retryCount - 1);
+            }
+            return null;
+        }
     }
 
     /**
-     * 设置CheckBox的背景
+     * 创建一张指定大小的纯色图片，支持圆角
      *
-     * @param cb
-     * @param unselected
-     * @param selected
+     * @param resources    Resources对象，用于创建BitmapDrawable
+     * @param width        图片的宽度
+     * @param height       图片的高度
+     * @param cornerRadius 图片的圆角，不需要则传0
+     * @param filledColor  图片的填充色
+     * @return 指定大小的纯色图片
      */
-    private void setCheckBoxBackground(CheckBox cb, GradientDrawable unselected, GradientDrawable selected) {
+    public static BitmapDrawable createDrawableWithSize(Resources resources, int width, int height, int cornerRadius, @ColorInt int filledColor) {
+        Bitmap output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(output);
+
+        if (filledColor == 0) {
+            filledColor = Color.TRANSPARENT;
+        }
+        if (cornerRadius > 0) {
+            Paint paint = new Paint();
+            paint.setAntiAlias(true);
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(filledColor);
+            canvas.drawRoundRect(new RectF(0, 0, width, height), cornerRadius, cornerRadius, paint);
+        } else {
+            canvas.drawColor(filledColor);
+        }
+        return new BitmapDrawable(resources, output);
+    }
+
+    /**
+     * 设置Drawable的颜色
+     * <b>这里不对Drawable进行mutate()，会影响到所有用到这个Drawable的地方，如果要避免，请先自行mutate()</b>
+     */
+    public static ColorFilter setDrawableTintColor(Drawable drawable, @ColorInt int tintColor) {
+        LightingColorFilter colorFilter = new LightingColorFilter(Color.argb(255, 0, 0, 0), tintColor);
+        if (drawable != null) {
+            drawable.setColorFilter(colorFilter);
+        }
+        return colorFilter;
+    }
+
+    /**
+     * 创建一张渐变图片，支持韵脚。
+     *
+     * @param startColor 渐变开始色
+     * @param endColor   渐变结束色
+     * @param radius     圆角大小
+     * @param centerX    渐变中心点 X 轴坐标
+     * @param centerY    渐变中心点 Y 轴坐标
+     * @return 返回所创建的渐变图片。
+     */
+    public static GradientDrawable createCircleGradientDrawable(@ColorInt int startColor,
+                                                                @ColorInt int endColor, int radius,
+                                                                @FloatRange(from = 0f, to = 1f) float centerX,
+                                                                @FloatRange(from = 0f, to = 1f) float centerY) {
+        GradientDrawable gradientDrawable = new GradientDrawable();
+        gradientDrawable.setColors(new int[]{
+                startColor,
+                endColor
+        });
+        gradientDrawable.setGradientType(GradientDrawable.RADIAL_GRADIENT);
+        gradientDrawable.setGradientRadius(radius);
+        gradientDrawable.setGradientCenter(centerX, centerY);
+        return gradientDrawable;
+    }
+
+
+    /**
+     * 动态创建带上分隔线或下分隔线的Drawable。
+     *
+     * @param separatorColor 分割线颜色。
+     * @param bgColor        Drawable 的背景色。
+     * @param top            true 则分割线为上分割线，false 则为下分割线。
+     * @return 返回所创建的 Drawable。
+     */
+    public static LayerDrawable createItemSeparatorBg(@ColorInt int separatorColor, @ColorInt int bgColor, int separatorHeight, boolean top) {
+
+        ShapeDrawable separator = new ShapeDrawable();
+        separator.getPaint().setStyle(Paint.Style.FILL);
+        separator.getPaint().setColor(separatorColor);
+
+        ShapeDrawable bg = new ShapeDrawable();
+        bg.getPaint().setStyle(Paint.Style.FILL);
+        bg.getPaint().setColor(bgColor);
+
+        Drawable[] layers = {separator, bg};
+        LayerDrawable layerDrawable = new LayerDrawable(layers);
+
+        layerDrawable.setLayerInset(1, 0, top ? separatorHeight : 0, 0, top ? 0 : separatorHeight);
+        return layerDrawable;
+    }
+
+
+    /**
+     * 创建一张指定大小的圆形图片，并附带文字
+     *
+     * @param resources   Resources对象，用于创建BitmapDrawable
+     * @param size        图片的宽度
+     * @param filledColor 图片的填充色
+     * @param text        文字
+     * @param textSize    文字大小(px)
+     * @param textColor   文字颜色
+     * @return 指定大小的纯色图片
+     */
+    public static BitmapDrawable createCircleDrawableWithText(Resources resources, int size, @ColorInt int filledColor, String text, float textSize, @ColorInt int textColor) {
+        if (size <= 0) {
+            throw new InvalidParameterException("bitmap size must be > 0!");
+        }
+        if (textSize <= 0) {
+            throw new InvalidParameterException("text size must be > 0!");
+        }
+        Bitmap output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(output);
+        canvas.drawColor(Color.TRANSPARENT);
+        // 画圆
+        int radius = size / 2;
+        Paint paint = new Paint();
+        paint.setAntiAlias(true);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(filledColor);
+        canvas.drawCircle(radius, radius, radius, paint);
+        // 画文字
+        paint.setColor(textColor);
+        paint.setTextSize(textSize);
+        paint.setTextAlign(Paint.Align.CENTER);
+        float baseline = radius + getBaselineDistance(paint);
+        canvas.drawText(text, radius, baseline, paint);
+        return new BitmapDrawable(resources, output);
+    }
+
+    /**
+     * 获取画笔的基线距离
+     *
+     * @param paint 画笔
+     * @return 基线距离
+     */
+    public static float getBaselineDistance(@NonNull Paint paint) {
+        Paint.FontMetrics fontMetrics = paint.getFontMetrics();
+        return (fontMetrics.bottom - fontMetrics.top) / 2 - fontMetrics.bottom;
+    }
+
+    /////////////// StateListDrawable /////////////////////
+
+    /**
+     * 实体 得到随机色 状态选择器
+     *
+     * @param cornerRadius 圆角半径
+     * @return 状态选择器
+     */
+    public static StateListDrawable getDrawable(int cornerRadius) {
+        return getDrawable(cornerRadius, ColorUtils.getRandomColor());
+    }
+
+    /**
+     * 实体 按下的颜色加深
+     *
+     * @param cornerRadius 圆角半径
+     * @param normalColor  正常的颜色
+     * @return 状态选择器
+     */
+
+    public static StateListDrawable getDrawable(int cornerRadius, int normalColor) {
+        return getDrawable(cornerRadius, ColorUtils.darker(normalColor, 0.8F), normalColor);
+    }
+
+    /**
+     * 实体  状态选择器
+     *
+     * @param cornerRadius 圆角半径
+     * @param pressedColor 按下颜色
+     * @param normalColor  正常的颜色
+     * @return 状态选择器
+     */
+    public static StateListDrawable getDrawable(int cornerRadius, int pressedColor, int normalColor) {
+        return getStateListDrawable(getSolidRectDrawable(cornerRadius, pressedColor), getSolidRectDrawable(cornerRadius, normalColor));
+    }
+
+    /**
+     * 背景选择器
+     *
+     * @param pressedDrawable 按下状态的Drawable
+     * @param normalDrawable  正常状态的Drawable
+     * @return 状态选择器
+     */
+    public static StateListDrawable getStateListDrawable(Drawable pressedDrawable, Drawable normalDrawable) {
         StateListDrawable stateListDrawable = new StateListDrawable();
-        stateListDrawable.addState(new int[]{-android.R.attr.state_checked}, unselected);
-        stateListDrawable.addState(new int[]{android.R.attr.state_checked}, selected);
-        if (Build.VERSION.SDK_INT < JELLY_BEAN) {
-            cb.setBackgroundDrawable(stateListDrawable);
-        } else {
-            cb.setBackground(stateListDrawable);
-        }
-    }
-
-    public boolean isChecked(int position) {
-        return ((CheckBox) getChildAt(position)).isChecked();
-    }
-
-    public void setIsChecked(int position, boolean isChecked) {
-        CheckBox cb = (CheckBox) getChildAt(position);
-        if (cb != null) {
-            cb.setChecked(isChecked);
-        }
+        stateListDrawable.addState(new int[]{android.R.attr.state_enabled, android.R.attr.state_pressed}, pressedDrawable);
+        stateListDrawable.addState(new int[]{android.R.attr.state_enabled}, normalDrawable);
+        //设置不能用的状态
+        //默认其他状态背景
+        GradientDrawable gray = getSolidRectDrawable(10, Color.GRAY);
+        stateListDrawable.addState(new int[]{}, gray);
+        return stateListDrawable;
     }
 
     /**
-     * 为每一个选项设置 items and values
+     * 得到实心的drawable, 一般作为选中，点中的效果
      *
-     * @param itemArray
-     * @param valueArray
+     * @param cornerRadius 圆角半径
+     * @param solidColor   实心颜色
+     * @return 得到实心效果
      */
-    public MultiTabControlView setItems(String[] itemArray, String[] valueArray) throws Exception {
-        mItemMap.clear();
-        if (itemArray != null && valueArray != null) {
-            if (itemArray.length != valueArray.length) {
-                throw new Exception("Item labels and value arrays must be the same size");
-            }
-        }
-        if (itemArray != null) {
-            if (valueArray != null) {
-                for (int i = 0; i < itemArray.length; i++) {
-                    mItemMap.put(itemArray[i], valueArray[i]);
-                }
-            } else {
-                for (CharSequence item : itemArray) {
-                    mItemMap.put(item.toString(), item.toString());
-                }
-            }
-        }
-        update();
-        return this;
+    public static GradientDrawable getSolidRectDrawable(int cornerRadius, int solidColor) {
+        GradientDrawable gradientDrawable = new GradientDrawable();
+        // 设置矩形的圆角半径
+        gradientDrawable.setCornerRadius(cornerRadius);
+        // 设置绘画图片色值
+        gradientDrawable.setColor(solidColor);
+        // 绘画的是矩形
+        gradientDrawable.setGradientType(GradientDrawable.RADIAL_GRADIENT);
+        return gradientDrawable;
     }
 
-    private void setItems(CharSequence[] itemArray, CharSequence[] valueArray) throws Exception {
-        if (itemArray != null && valueArray != null) {
-            if (itemArray.length != valueArray.length) {
-                throw new Exception("Item labels and value arrays must be the same size");
-            }
-        }
-        if (itemArray != null) {
-            if (valueArray != null) {
-                for (int i = 0; i < itemArray.length; i++) {
-                    mItemMap.put(itemArray[i].toString(), valueArray[i].toString());
-                }
-            } else {
-                for (CharSequence item : itemArray) {
-                    mItemMap.put(item.toString(), item.toString());
-                }
-            }
+    /////////////// VectorDrawable /////////////////////
+
+    @Nullable
+    public static Drawable getVectorDrawable(Context context, @DrawableRes int resVector) {
+        try {
+            return AppCompatResources.getDrawable(context, resVector);
+        } catch (Exception e) {
+            return null;
         }
     }
+
+    public static Bitmap vectorDrawableToBitmap(Context context, @DrawableRes int resVector) {
+        Drawable drawable = getVectorDrawable(context, resVector);
+        if (drawable != null) {
+            return drawable2Bitmap(drawable);
+        }
+        return null;
+    }
+
+    /////////////// VectorDrawable /////////////////////
 
     /**
-     * 为每一个选项设置 items and values .并且设置默认选中的序号
+     * 获取支持RTL布局的drawable【如果是RTL布局就旋转180度】
      *
-     * @param items
-     * @param values
-     * @param defaultSelection
-     */
-    public MultiTabControlView setItems(String[] items, String[] values, int... defaultSelection) throws Exception {
-        if (defaultSelection == null) {
-            throw new Exception("defaultSelectionList cannot be null");
-        } else if (defaultSelection.length > items.length) {
-            throw new Exception("the length of Default selectionList cannot be greater than the length of items");
-        } else {
-            for (int selection : defaultSelection) {
-                if (selection > (mItemMap.size() - 1)) {
-                    throw new Exception("Default selection cannot be greater than the number of items");
-                }
-            }
-            mDefaultSelectionList = defaultSelection;
-            setItems(items, values);
-        }
-        return this;
-    }
-
-    /**
-     * 设置默认选中的Tab.
-     *
-     * @param defaultSelections
-     */
-    public MultiTabControlView setDefaultSelection(int... defaultSelections) throws Exception {
-        if (defaultSelections == null) {
-            throw new Exception("defaultSelectionList cannot be null");
-        } else if (defaultSelections.length > mItemMap.size()) {
-            throw new Exception("the length of Default selectionList cannot be greater than the length of items");
-        } else {
-            for (int selection : defaultSelections) {
-                if (selection > (mItemMap.size() - 1)) {
-                    throw new Exception("Default selection cannot be greater than the number of items");
-                }
-            }
-            mDefaultSelectionList = defaultSelections;
-            update();
-        }
-        return this;
-    }
-
-    /**
-     * 设置默认选中的Tab.
-     *
-     * @param defaultSelections
-     */
-    public MultiTabControlView setDefaultSelection(@NonNull List<Integer> defaultSelections) throws Exception {
-        int[] selections = new int[defaultSelections.size()];
-        for (int i = 0; i < selections.length; i++) {
-            selections[i] = defaultSelections.get(i);
-        }
-        setDefaultSelection(selections);
-        return this;
-    }
-
-    /**
-     * 通过值 设置选中的Tab
-     *
-     * @param values
-     */
-    public MultiTabControlView setSelection(String... values) {
-        for (String value : values) {
-            setSelection(value);
-        }
-        return this;
-    }
-
-    /**
-     * 通过值 设置选中的Tab
-     *
-     * @param value
-     */
-    public MultiTabControlView setSelection(String value) {
-        setSelectionStatus(value, true);
-        return this;
-    }
-
-    /**
-     * 通过值 设置tab的选中状态
-     *
-     * @param value
-     */
-    public MultiTabControlView setSelectionStatus(String value, boolean isChecked) {
-        String title = getTitleByValue(value);
-        setSelectionStatusByTitle(title, isChecked);
-        return this;
-    }
-
-    /**
-     * 静默通过标题设置tab的选中状态
-     *
-     * @param title
-     * @param isChecked
+     * @param src 原drawable
      * @return
      */
-    public MultiTabControlView setSelectionStatusByTitle(String title, boolean isChecked) {
-        setSelectionStatusByTitle(title, isChecked, true);
-        return this;
+    public static Drawable getSupportRTLDrawable(Drawable src) {
+        return getSupportRTLDrawable(src, false);
     }
 
     /**
-     * 通过标题设置tab的选中状态
+     * 获取支持RTL布局的drawable【如果是RTL布局就旋转180度】
      *
-     * @param title
-     * @param isChecked 是否选中
-     * @param isSilent  是否静默设置
+     * @param src 原drawable
      * @return
      */
-    public MultiTabControlView setSelectionStatusByTitle(String title, boolean isChecked, boolean isSilent) {
-        for (CheckBox option : mOptions) {
-            if (option.getText().toString().equalsIgnoreCase(title)) {
-                if (isSilent) {
-                    option.setOnCheckedChangeListener(null);
-                    option.setChecked(isChecked);
-                    addOnCheckedChangeListener(option);
-                } else {
-                    option.setChecked(isChecked);
-                }
+    public static Drawable getSupportRTLDrawable(Drawable src, boolean recycle) {
+        if (ResUtils.isRtl()) {
+            return rotate(src, 180, 0, 0, recycle);
+        }
+        return src;
+    }
+
+    /**
+     * Return the rotated drawable.
+     *
+     * @param src     The source of drawable.
+     * @param degrees The number of degrees.
+     * @param px      The x coordinate of the pivot point.
+     * @param py      The y coordinate of the pivot point.
+     * @param recycle True to recycle the source of drawable, false otherwise.
+     * @return the rotated drawable
+     */
+    public static Drawable rotate(final Drawable src,
+                                  final int degrees,
+                                  final float px,
+                                  final float py,
+                                  final boolean recycle) {
+        return bitmap2Drawable(rotate(drawable2Bitmap(src), degrees, px, py, recycle));
+    }
+
+    /**
+     * Return the rotated bitmap.
+     *
+     * @param src     The source of bitmap.
+     * @param degrees The number of degrees.
+     * @param px      The x coordinate of the pivot point.
+     * @param py      The y coordinate of the pivot point.
+     * @param recycle True to recycle the source of bitmap, false otherwise.
+     * @return the rotated bitmap
+     */
+    public static Bitmap rotate(final Bitmap src,
+                                final int degrees,
+                                final float px,
+                                final float py,
+                                final boolean recycle) {
+        if (isEmptyBitmap(src)) {
+            return null;
+        }
+        if (src.isRecycled()) {
+            return null;
+        }
+        if (degrees == 0) {
+            return src;
+        }
+        Matrix matrix = new Matrix();
+        matrix.setRotate(degrees, px, py);
+        Bitmap ret = Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), matrix, true);
+        if (recycle && !src.isRecycled()) {
+            src.recycle();
+        }
+        return ret;
+    }
+
+    private static boolean isEmptyBitmap(final Bitmap src) {
+        return src == null || src.getWidth() == 0 || src.getHeight() == 0;
+    }
+
+    /**
+     * 获取图片
+     *
+     * @param context 上下文
+     * @param resId   图片资源
+     * @return 图片
+     */
+    public static Bitmap getBitmapByDrawableId(Context context, @DrawableRes int resId) {
+        return drawable2Bitmap(ResUtils.getDrawable(context, resId));
+    }
+
+    /**
+     * Drawable to bitmap.
+     *
+     * @param drawable The drawable.
+     * @return bitmap
+     */
+    public static Bitmap drawable2Bitmap(final Drawable drawable) {
+        if (drawable == null) {
+            return null;
+        }
+        if (drawable instanceof BitmapDrawable) {
+            BitmapDrawable bitmapDrawable = (BitmapDrawable) drawable;
+            if (bitmapDrawable.getBitmap() != null) {
+                return bitmapDrawable.getBitmap();
             }
         }
-        return this;
-    }
-
-    private String getTitleByValue(String value) {
-        if (mItemMap.containsValue(value)) {
-            String title;
-            for (String key : mItemMap.keySet()) {
-                title = mItemMap.get(key);
-                if (title != null && title.equalsIgnoreCase(value)) {
-                    return key;
-                }
-            }
+        Bitmap bitmap;
+        if (drawable.getIntrinsicWidth() <= 0 || drawable.getIntrinsicHeight() <= 0) {
+            bitmap = Bitmap.createBitmap(1, 1,
+                    drawable.getOpacity() != PixelFormat.OPAQUE
+                            ? Bitmap.Config.ARGB_8888
+                            : Bitmap.Config.RGB_565);
+        } else {
+            bitmap = Bitmap.createBitmap(drawable.getIntrinsicWidth(),
+                    drawable.getIntrinsicHeight(),
+                    drawable.getOpacity() != PixelFormat.OPAQUE
+                            ? Bitmap.Config.ARGB_8888
+                            : Bitmap.Config.RGB_565);
         }
-        return "";
+        Canvas canvas = new Canvas(bitmap);
+        drawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+        drawable.draw(canvas);
+        return bitmap;
     }
 
     /**
-     * Sets the colors used when drawing the view. The primary color will be used for selected color
-     * and unselected text color, while the secondary color will be used for unselected color
-     * and selected text color.
+     * Bitmap to drawable.
      *
-     * @param primaryColor
-     * @param secondaryColor
+     * @param bitmap The bitmap.
+     * @return drawable
      */
-    public MultiTabControlView setColors(int primaryColor, int secondaryColor) {
-        mSelectedColor = primaryColor;
-        mSelectedTextColor = secondaryColor;
-        mUnselectedColor = secondaryColor;
-        mUnselectedTextColor = primaryColor;
-
-        //Set text mSelectedColor state list
-        mTextColorStateList = new ColorStateList(new int[][]{
-                {-android.R.attr.state_checked}, {android.R.attr.state_checked}},
-                new int[]{mUnselectedTextColor, mSelectedTextColor}
-        );
-
-        update();
-        return this;
-    }
-
-    /**
-     * 设置颜色
-     *
-     * @param selectedColor
-     * @param selectedTextColor
-     * @param unselectedColor
-     * @param unselectedTextColor
-     */
-    public MultiTabControlView setColors(int selectedColor, int selectedTextColor, int unselectedColor, int unselectedTextColor) {
-        mSelectedColor = selectedColor;
-        mSelectedTextColor = selectedTextColor;
-        mUnselectedColor = unselectedColor;
-        mUnselectedTextColor = unselectedTextColor;
-
-        //Set text mSelectedColor state list
-        mTextColorStateList = new ColorStateList(new int[][]{
-                {-android.R.attr.state_checked}, {android.R.attr.state_checked}},
-                new int[]{unselectedTextColor, selectedTextColor}
-        );
-
-        update();
-        return this;
-    }
-
-    /**
-     * 设置Tab选中的监听
-     *
-     * @param listener
-     */
-    public MultiTabControlView setOnMultiTabSelectionChangedListener(OnMultiTabSelectionChangedListener listener) {
-        mListener = listener;
-        return this;
-    }
-
-    /**
-     * 设置是否等宽
-     *
-     * @param equalWidth
-     */
-    public MultiTabControlView setEqualWidth(boolean equalWidth) {
-        mEqualWidth = equalWidth;
-        update();
-        return this;
-    }
-
-    /**
-     * 设置是否伸展开（match_parent)
-     *
-     * @param stretch
-     */
-    public MultiTabControlView setStretch(boolean stretch) {
-        mStretch = stretch;
-        update();
-        return this;
-    }
-
-    @Override
-    public void setTypeface(Typeface typeface) {
-        if (mOptions != null) {
-            for (int i = 0; i < mOptions.size(); i++) {
-                mOptions.get(i).setTypeface(typeface);
-            }
-        }
-    }
-
-    @Override
-    protected void onConfigurationChanged(Configuration newConfig) {
-        super.onConfigurationChanged(newConfig);
-        update();
-    }
-
-    /**
-     * Tab选中的监听
-     */
-    public interface OnMultiTabSelectionChangedListener {
-        /**
-         * 选中
-         *
-         * @param title     选中展示的内容
-         * @param value     选中的值
-         * @param isChecked 是否选中
-         */
-        void newSelection(String title, String value, boolean isChecked);
+    public static Drawable bitmap2Drawable(final Bitmap bitmap) {
+        return bitmap == null ? null : new BitmapDrawable(ResUtils.getResources(), bitmap);
     }
 }
